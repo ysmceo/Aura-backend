@@ -5424,7 +5424,7 @@ app.get('/api/product-orders/payments/paystack/verify/:reference', async (req, r
 });
 
 // Update booking status (Admin)
-app.put('/api/admin/bookings/:id', requireAdminAuth, requireAdminRole(['super-admin', 'ops']), async (req, res) => {
+app.put('/api/admin/bookings/:id', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   const { status } = req.body;
   const bookingId = req.params.id;
 
@@ -5557,7 +5557,7 @@ app.put('/api/admin/bookings/:id', requireAdminAuth, requireAdminRole(['super-ad
 });
 
 // Approve or disapprove booking image
-app.put('/api/admin/bookings/:id/approve-image', requireAdminAuth, requireAdminRole(['super-admin', 'ops']), (req, res) => {
+app.put('/api/admin/bookings/:id/approve-image', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), (req, res) => {
   const { approved } = req.body;
   const bookingId = req.params.id;
 
@@ -5602,7 +5602,7 @@ app.put('/api/admin/bookings/:id/approve-image', requireAdminAuth, requireAdminR
 
 // Test booking status notifications (Admin)
 // This endpoint helps confirm email/SMS delivery config without changing booking status.
-app.post('/api/admin/bookings/:id/test-notify', requireAdminAuth, requireAdminRole(['super-admin', 'ops']), async (req, res) => {
+app.post('/api/admin/bookings/:id/test-notify', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   const bookingId = String(req.params.id || '').trim();
   const status = String((req.body && req.body.status) || 'approved').trim().toLowerCase();
 
@@ -5655,7 +5655,7 @@ app.post('/api/admin/bookings/:id/test-notify', requireAdminAuth, requireAdminRo
 });
 
 // Notify booking customer about staff/chair assignment (Admin)
-app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireAdminRole(['super-admin', 'ops']), async (req, res) => {
+app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   try {
     const bookingId = String(req.params.id || '').trim();
     const staff = String(req.body && req.body.staff ? req.body.staff : '').trim();
@@ -5956,7 +5956,7 @@ app.get('/api/admin/messages', requireAdminAuth, (req, res) => {
 });
 
 // Update message status (Admin)
-app.put('/api/admin/messages/:id', requireAdminAuth, (req, res) => {
+app.put('/api/admin/messages/:id', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), (req, res) => {
   const { status } = req.body;
   const messageId = req.params.id;
 
@@ -5967,25 +5967,46 @@ app.put('/api/admin/messages/:id', requireAdminAuth, (req, res) => {
     return res.status(404).json({ error: 'Message not found' });
   }
 
+  const previousStatus = String(msg.status || '');
   msg.status = status;
   msg.updatedAt = new Date().toISOString();
+
+  pushAuditLog(db, {
+    actor: toPublicAdmin(req.admin),
+    action: 'update_message_status',
+    targetType: 'message',
+    targetId: String(messageId),
+    before: { status: previousStatus },
+    after: { status: String(status || '') }
+  });
+
   writeDatabase(db);
 
   res.json({ message: 'Message updated successfully', data: msg });
 });
 
 // Delete message (Admin)
-app.delete('/api/admin/messages/:id', requireAdminAuth, (req, res) => {
+app.delete('/api/admin/messages/:id', requireAdminAuth, requireAdminRole(['super-admin', 'support']), (req, res) => {
   const messageId = req.params.id;
   const db = readDatabase();
+  const existingMessage = db.messages.find(m => m.id === messageId) || null;
   db.messages = db.messages.filter(m => m.id !== messageId);
+
+  pushAuditLog(db, {
+    actor: toPublicAdmin(req.admin),
+    action: 'delete_message',
+    targetType: 'message',
+    targetId: String(messageId),
+    before: existingMessage
+  });
+
   writeDatabase(db);
 
   res.json({ message: 'Message deleted successfully' });
 });
 
 // Reply to a customer message/complaint via email (Admin)
-app.post('/api/admin/messages/:id/reply', requireAdminAuth, async (req, res) => {
+app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   try {
     const messageId = String(req.params.id || '').trim();
     const subject = String(req.body && req.body.subject ? req.body.subject : '').trim();
@@ -6095,6 +6116,21 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, async (req, res) => 
     msg.lastRepliedAt = new Date().toISOString();
     msg.status = 'read';
     msg.updatedAt = new Date().toISOString();
+
+    pushAuditLog(db, {
+      actor: toPublicAdmin(req.admin),
+      action: 'reply_message',
+      targetType: 'message',
+      targetId: String(messageId),
+      after: {
+        subject,
+        delivery: delivery && typeof delivery === 'object' ? {
+          sent: Boolean(delivery.sent),
+          reason: delivery.reason ? String(delivery.reason) : ''
+        } : null
+      }
+    });
+
     writeDatabase(db);
 
     res.json({
@@ -6116,7 +6152,7 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, async (req, res) => 
 });
 
 // Reply to a booking customer via email (Admin)
-app.post('/api/admin/bookings/:id/reply', requireAdminAuth, async (req, res) => {
+app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   try {
     const bookingId = String(req.params.id || '').trim();
     const subject = String(req.body && req.body.subject ? req.body.subject : '').trim();
@@ -6161,13 +6197,47 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, async (req, res) => 
       </div>
     `;
 
-    const info = await sendEmail({
-      to: toEmail,
-      subject,
-      text: emailText,
-      html: emailHtml,
-      replyTo: adminEmail || undefined
-    });
+    let info = null;
+    let delivery = {
+      sent: false,
+      channel: 'smtp',
+      skipped: false,
+      reason: ''
+    };
+
+    if (!isSmtpConfigured()) {
+      delivery = {
+        sent: false,
+        channel: 'manual',
+        skipped: true,
+        reason: 'SMTP not configured. Reply saved in admin history.'
+      };
+    } else {
+      try {
+        info = await sendEmail({
+          to: toEmail,
+          subject,
+          text: emailText,
+          html: emailHtml,
+          replyTo: adminEmail || undefined
+        });
+
+        delivery = {
+          sent: true,
+          channel: 'smtp',
+          skipped: false,
+          reason: ''
+        };
+      } catch (sendError) {
+        delivery = {
+          sent: false,
+          channel: 'smtp',
+          skipped: false,
+          error: true,
+          reason: sendError && sendError.message ? String(sendError.message) : 'Email send failed'
+        };
+      }
+    }
 
     if (!Array.isArray(booking.replies)) {
       booking.replies = [];
@@ -6186,24 +6256,44 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, async (req, res) => 
       transport: {
         messageId: info && info.messageId ? info.messageId : undefined,
         accepted: info && info.accepted ? info.accepted : undefined,
-        rejected: info && info.rejected ? info.rejected : undefined
+        rejected: info && info.rejected ? info.rejected : undefined,
+        reason: delivery && delivery.reason ? delivery.reason : undefined
       },
       sentAt: new Date().toISOString()
     });
 
     booking.lastRepliedAt = new Date().toISOString();
     booking.updatedAt = new Date().toISOString();
+
+    pushAuditLog(db, {
+      actor: toPublicAdmin(req.admin),
+      action: 'reply_booking',
+      targetType: 'booking',
+      targetId: String(bookingId),
+      after: {
+        subject,
+        to: toEmail,
+        delivery: delivery && typeof delivery === 'object' ? {
+          sent: Boolean(delivery.sent),
+          reason: delivery.reason ? String(delivery.reason) : ''
+        } : null
+      }
+    });
+
     writeDatabase(db);
 
     res.json({
-      message: 'Booking reply sent successfully',
+      message: delivery.sent
+        ? 'Booking reply sent successfully'
+        : 'Booking reply saved successfully. Email delivery unavailable.',
       to: toEmail,
       replyCount: booking.replies.length,
-      bookingId: booking.id
+      bookingId: booking.id,
+      delivery
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'BOOKING_REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' ? 503 : 500;
+    const status = 500;
     res.status(status).json({
       error: error && error.message ? error.message : 'Failed to send booking reply',
       code
@@ -6212,7 +6302,7 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, async (req, res) => 
 });
 
 // Reply to a product-order customer via email (Admin)
-app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, async (req, res) => {
+app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRole(['super-admin', 'ops', 'support']), async (req, res) => {
   try {
     const orderId = String(req.params.id || '').trim();
     const subject = String(req.body && req.body.subject ? req.body.subject : '').trim();
@@ -6259,13 +6349,47 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, async (req, re
       </div>
     `;
 
-    const info = await sendEmail({
-      to: toEmail,
-      subject,
-      text: emailText,
-      html: emailHtml,
-      replyTo: adminEmail || undefined
-    });
+    let info = null;
+    let delivery = {
+      sent: false,
+      channel: 'smtp',
+      skipped: false,
+      reason: ''
+    };
+
+    if (!isSmtpConfigured()) {
+      delivery = {
+        sent: false,
+        channel: 'manual',
+        skipped: true,
+        reason: 'SMTP not configured. Reply saved in admin history.'
+      };
+    } else {
+      try {
+        info = await sendEmail({
+          to: toEmail,
+          subject,
+          text: emailText,
+          html: emailHtml,
+          replyTo: adminEmail || undefined
+        });
+
+        delivery = {
+          sent: true,
+          channel: 'smtp',
+          skipped: false,
+          reason: ''
+        };
+      } catch (sendError) {
+        delivery = {
+          sent: false,
+          channel: 'smtp',
+          skipped: false,
+          error: true,
+          reason: sendError && sendError.message ? String(sendError.message) : 'Email send failed'
+        };
+      }
+    }
 
     if (!Array.isArray(order.replies)) {
       order.replies = [];
@@ -6284,25 +6408,46 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, async (req, re
       transport: {
         messageId: info && info.messageId ? info.messageId : undefined,
         accepted: info && info.accepted ? info.accepted : undefined,
-        rejected: info && info.rejected ? info.rejected : undefined
+        rejected: info && info.rejected ? info.rejected : undefined,
+        reason: delivery && delivery.reason ? delivery.reason : undefined
       },
       sentAt: new Date().toISOString()
     });
 
     order.lastRepliedAt = new Date().toISOString();
     order.updatedAt = new Date().toISOString();
+
+    pushAuditLog(db, {
+      actor: toPublicAdmin(req.admin),
+      action: 'reply_product_order',
+      targetType: 'product_order',
+      targetId: String(orderId),
+      after: {
+        subject,
+        to: toEmail,
+        orderCode: orderCode || null,
+        delivery: delivery && typeof delivery === 'object' ? {
+          sent: Boolean(delivery.sent),
+          reason: delivery.reason ? String(delivery.reason) : ''
+        } : null
+      }
+    });
+
     writeDatabase(db);
 
     return res.json({
-      message: 'Order reply sent successfully',
+      message: delivery.sent
+        ? 'Order reply sent successfully'
+        : 'Order reply saved successfully. Email delivery unavailable.',
       to: toEmail,
       replyCount: order.replies.length,
       orderId: order.id,
-      orderCode: orderCode || null
+      orderCode: orderCode || null,
+      delivery
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'ORDER_REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' ? 503 : 500;
+    const status = 500;
     return res.status(status).json({
       error: error && error.message ? String(error.message) : 'Failed to send order reply',
       code
