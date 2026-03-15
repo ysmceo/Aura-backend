@@ -108,9 +108,22 @@ function getStripeRequestOptions() {
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true';
+const SMTP_SERVICE = String(process.env.SMTP_SERVICE || '').trim();
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM = process.env.SMTP_FROM || 'CEO Unisex Salon <no-reply@ceosaloon.com>';
+const SMTP_FROM = process.env.SMTP_FROM || 'Aura Salon <no-reply@aurasalon.com>';
+const EMAIL_RETRY_MAX_ATTEMPTS = Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS) > 0
+  ? Math.min(6, Math.max(1, Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS)))
+  : 3;
+const EMAIL_RETRY_BASE_DELAY_MS = Number(process.env.EMAIL_RETRY_BASE_DELAY_MS) > 0
+  ? Math.max(250, Number(process.env.EMAIL_RETRY_BASE_DELAY_MS))
+  : 1500;
+const EMAIL_DEDUP_WINDOW_MS = Number(process.env.EMAIL_DEDUP_WINDOW_MS) > 0
+  ? Math.max(1000, Number(process.env.EMAIL_DEDUP_WINDOW_MS))
+  : 3 * 60 * 1000;
+const EMAIL_QUEUE_CONCURRENCY = Number(process.env.EMAIL_QUEUE_CONCURRENCY) > 0
+  ? Math.min(6, Math.max(1, Number(process.env.EMAIL_QUEUE_CONCURRENCY)))
+  : 1;
 const SEND_PAYMENT_EMAIL_RECEIPTS = String(process.env.SEND_PAYMENT_EMAIL_RECEIPTS || 'false').trim().toLowerCase() === 'true';
 const SEND_BOOKING_STATUS_EMAILS = String(process.env.SEND_BOOKING_STATUS_EMAILS || 'false').trim().toLowerCase() === 'true';
 const SEND_ADMIN_NEW_BOOKING_EMAILS = String(process.env.SEND_ADMIN_NEW_BOOKING_EMAILS || 'false').trim().toLowerCase() === 'true';
@@ -135,7 +148,7 @@ const ADMIN_OTP_DELIVERY_TIMEOUT_MS = Number(process.env.ADMIN_OTP_DELIVERY_TIME
 const SEND_BOOKING_STATUS_SMS = String(process.env.SEND_BOOKING_STATUS_SMS || 'false').trim().toLowerCase() === 'true';
 const TERMII_API_KEY = process.env.TERMII_API_KEY || '';
 // Keep sender ID short to fit common SMS sender-id length limits; override in .env if needed.
-const TERMII_SENDER_ID = process.env.TERMII_SENDER_ID || 'CEO UNISEX';
+const TERMII_SENDER_ID = process.env.TERMII_SENDER_ID || 'AURA SALON';
 const TERMII_CHANNEL = String(process.env.TERMII_CHANNEL || 'generic').trim();
 const TERMII_BASE_URL = String(process.env.TERMII_BASE_URL || 'https://api.ng.termii.com').trim().replace(/\/+$/, '');
 
@@ -178,18 +191,28 @@ function normalizePhoneToE164(phone) {
 }
 
 function isSmtpConfigured() {
-  return Boolean(String(SMTP_HOST || '').trim()) &&
+  const hasService = Boolean(String(SMTP_SERVICE || '').trim());
+  const hasHost = Boolean(String(SMTP_HOST || '').trim());
+  return Boolean(hasService || hasHost) &&
     Boolean(Number.isFinite(SMTP_PORT) && SMTP_PORT > 0) &&
     Boolean(String(SMTP_USER || '').trim()) &&
     Boolean(String(SMTP_PASS || '').trim());
 }
 
 function isGmailHostConfigured() {
+  const service = String(SMTP_SERVICE || '').trim().toLowerCase();
+  if (service === 'gmail') {
+    return true;
+  }
+
   const host = String(SMTP_HOST || '').trim().toLowerCase();
   return host === 'smtp.gmail.com' || host.endsWith('.gmail.com');
 }
 
 const mailerCache = new Map();
+const emailDedupCache = new Map();
+const emailQueuePending = [];
+let emailQueueActiveCount = 0;
 
 function shouldRetrySmtpWithFallback(error) {
   const message = String(error && error.message ? error.message : '').toLowerCase();
@@ -203,6 +226,84 @@ function shouldRetrySmtpWithFallback(error) {
   );
 }
 
+function isTransientEmailError(error) {
+  const message = String(error && error.message ? error.message : '').toLowerCase();
+  const code = String(error && error.code ? error.code : '').toUpperCase();
+  const responseCode = Number(error && error.responseCode ? error.responseCode : 0);
+
+  if (Number.isFinite(responseCode) && responseCode >= 400 && responseCode < 500) {
+    return true;
+  }
+
+  return (
+    message.includes('temporar') ||
+    message.includes('try again later') ||
+    message.includes('defer') ||
+    message.includes('rate limit') ||
+    message.includes('throttle') ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNECTION' ||
+    code === 'ESOCKET' ||
+    code === 'EAI_AGAIN'
+  );
+}
+
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cleanupEmailDedupCache(nowMs) {
+  for (const [key, createdAtMs] of emailDedupCache.entries()) {
+    if ((nowMs - Number(createdAtMs || 0)) > EMAIL_DEDUP_WINDOW_MS) {
+      emailDedupCache.delete(key);
+    }
+  }
+}
+
+function buildEmailDedupKey(mailPayload) {
+  const parts = {
+    from: String(mailPayload && mailPayload.from ? mailPayload.from : '').trim().toLowerCase(),
+    to: String(mailPayload && mailPayload.to ? mailPayload.to : '').trim().toLowerCase(),
+    bcc: String(mailPayload && mailPayload.bcc ? mailPayload.bcc : '').trim().toLowerCase(),
+    subject: String(mailPayload && mailPayload.subject ? mailPayload.subject : '').trim(),
+    text: String(mailPayload && mailPayload.text ? mailPayload.text : '').trim(),
+    html: String(mailPayload && mailPayload.html ? mailPayload.html : '').trim(),
+    replyTo: String(mailPayload && mailPayload.replyTo ? mailPayload.replyTo : '').trim().toLowerCase(),
+    attachments: Array.isArray(mailPayload && mailPayload.attachments)
+      ? mailPayload.attachments.map(item => `${String(item && item.filename ? item.filename : '')}:${Number(item && item.size ? item.size : 0)}`).join('|')
+      : ''
+  };
+
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+function processEmailQueue() {
+  while (emailQueueActiveCount < EMAIL_QUEUE_CONCURRENCY && emailQueuePending.length > 0) {
+    const next = emailQueuePending.shift();
+    emailQueueActiveCount += 1;
+
+    Promise.resolve()
+      .then(() => next.task())
+      .then((value) => {
+        emailQueueActiveCount -= 1;
+        next.resolve(value);
+        processEmailQueue();
+      })
+      .catch((error) => {
+        emailQueueActiveCount -= 1;
+        next.reject(error);
+        processEmailQueue();
+      });
+  }
+}
+
+function enqueueEmailTask(task) {
+  return new Promise((resolve, reject) => {
+    emailQueuePending.push({ task, resolve, reject });
+    processEmailQueue();
+  });
+}
+
 function getMailer(overrides = {}) {
   if (!isSmtpConfigured()) {
     const err = new Error('SMTP is not configured');
@@ -210,8 +311,12 @@ function getMailer(overrides = {}) {
     throw err;
   }
 
+  const resolvedHost = String(SMTP_HOST || '').trim();
+  const resolvedService = String(SMTP_SERVICE || '').trim();
+
   const baseOptions = {
-    host: String(SMTP_HOST).trim(),
+    host: resolvedHost || undefined,
+    service: resolvedService || undefined,
     port: SMTP_PORT,
     secure: SMTP_SECURE,
     requireTLS: !SMTP_SECURE,
@@ -219,7 +324,7 @@ function getMailer(overrides = {}) {
     greetingTimeout: 20_000,
     socketTimeout: 30_000,
     tls: {
-      servername: String(SMTP_HOST).trim(),
+      servername: resolvedHost || undefined,
       minVersion: 'TLSv1.2'
     },
     auth: {
@@ -265,35 +370,71 @@ async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments })
     attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined
   };
 
-  try {
-    const transporter = getMailer();
-    return await transporter.sendMail(mailPayload);
-  } catch (primaryError) {
-    // Common Gmail SMTP recovery path when STARTTLS/handshake fails in some networks.
-    if (isGmailHostConfigured() && shouldRetrySmtpWithFallback(primaryError)) {
+  const dedupKey = buildEmailDedupKey(mailPayload);
+
+  return enqueueEmailTask(async () => {
+    const nowMs = Date.now();
+    cleanupEmailDedupCache(nowMs);
+
+    const existing = Number(emailDedupCache.get(dedupKey) || 0);
+    if (existing && (nowMs - existing) <= EMAIL_DEDUP_WINDOW_MS) {
+      return {
+        messageId: `deduped-${dedupKey.slice(0, 12)}`,
+        accepted: [],
+        rejected: [],
+        deduped: true
+      };
+    }
+
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= EMAIL_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
-        const gmailFallbackTransporter = getMailer({
-          service: 'gmail',
-          host: 'smtp.gmail.com',
-          port: 465,
-          secure: true,
-          requireTLS: false,
-          tls: {
-            servername: 'smtp.gmail.com',
-            minVersion: 'TLSv1.2'
+        const transporter = getMailer();
+        const info = await transporter.sendMail(mailPayload);
+        emailDedupCache.set(dedupKey, Date.now());
+        return info;
+      } catch (primaryError) {
+        // Common Gmail SMTP recovery path when STARTTLS/handshake fails in some networks.
+        if (isGmailHostConfigured() && shouldRetrySmtpWithFallback(primaryError)) {
+          try {
+            const gmailFallbackTransporter = getMailer({
+              service: 'gmail',
+              host: 'smtp.gmail.com',
+              port: 465,
+              secure: true,
+              requireTLS: false,
+              tls: {
+                servername: 'smtp.gmail.com',
+                minVersion: 'TLSv1.2'
+              }
+            });
+            const info = await gmailFallbackTransporter.sendMail(mailPayload);
+            emailDedupCache.set(dedupKey, Date.now());
+            return info;
+          } catch (fallbackError) {
+            // Preserve original context while surfacing fallback failure details.
+            const err = new Error(`${String(primaryError && primaryError.message ? primaryError.message : 'SMTP send failed')} | Gmail fallback failed: ${String(fallbackError && fallbackError.message ? fallbackError.message : 'unknown')}`);
+            err.code = fallbackError && fallbackError.code ? fallbackError.code : (primaryError && primaryError.code ? primaryError.code : 'SMTP_SEND_FAILED');
+            err.responseCode = fallbackError && fallbackError.responseCode ? fallbackError.responseCode : (primaryError && primaryError.responseCode ? primaryError.responseCode : undefined);
+            lastError = err;
           }
-        });
-        return await gmailFallbackTransporter.sendMail(mailPayload);
-      } catch (fallbackError) {
-        // Preserve original context while surfacing fallback failure details.
-        const err = new Error(`${String(primaryError && primaryError.message ? primaryError.message : 'SMTP send failed')} | Gmail fallback failed: ${String(fallbackError && fallbackError.message ? fallbackError.message : 'unknown')}`);
-        err.code = fallbackError && fallbackError.code ? fallbackError.code : (primaryError && primaryError.code ? primaryError.code : 'SMTP_SEND_FAILED');
-        throw err;
+        } else {
+          lastError = primaryError;
+        }
+
+        const shouldRetry = attempt < EMAIL_RETRY_MAX_ATTEMPTS && isTransientEmailError(lastError || primaryError);
+        if (!shouldRetry) {
+          throw (lastError || primaryError);
+        }
+
+        const delayMs = Math.round((EMAIL_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)) + (Math.random() * 300));
+        await sleepMs(delayMs);
       }
     }
 
-    throw primaryError;
-  }
+    throw (lastError || new Error('SMTP send failed'));
+  });
 }
 
 async function maybeSendPaymentReceiptEmail({ booking, provider, paidAmount, reference, receiptUrl }) {
@@ -343,7 +484,7 @@ async function maybeSendPaymentReceiptEmail({ booking, provider, paidAmount, ref
     : '';
   const invoiceButtonHtml = buildEmailActionButton({ href: secureInvoiceUrl, label: 'View invoice PDF', bg: '#1d4ed8' });
 
-  const text = `Hi ${booking.name || 'Customer'},\n\nWe received your payment for your booking.\n\nBooking ID: ${bookingId}\nService: ${serviceName}\nAmount paid: ${amountText}\nProvider: ${providerLabel}\nReference: ${safeRef || 'N/A'}\nReceipt: ${safeReceiptUrl || 'N/A'}\nInvoice: ${secureInvoiceUrl}\n\nThank you for choosing CEO Unisex Salon.`;
+  const text = `Hi ${booking.name || 'Customer'},\n\nWe received your payment for your booking.\n\nBooking ID: ${bookingId}\nService: ${serviceName}\nAmount paid: ${amountText}\nProvider: ${providerLabel}\nReference: ${safeRef || 'N/A'}\nReceipt: ${safeReceiptUrl || 'N/A'}\nInvoice: ${secureInvoiceUrl}\n\nThank you for choosing Aura Salon.`;
 
   const html = buildColorfulEmailShell({
     title: 'Payment Receipt',
@@ -424,23 +565,23 @@ async function maybeSendBookingStatusEmail({ booking, previousStatus, newStatus 
   const refundStatementHtml = '<p style="margin:12px 0 0; color:#7f1d1d; font-size:13px;">Where payment has already been made, your refund will be processed to the original payment method within <strong>3 to 7 business days</strong>. Processing timelines may vary slightly by your bank or card issuer.</p>';
 
   const subject = next === 'approved'
-    ? `CEO Unisex Salon - Appointment Accepted${bookingId ? ` (${bookingId})` : ''}`
-    : `CEO Unisex Salon - Appointment Declined${bookingId ? ` (${bookingId})` : ''}`;
+    ? `Aura Salon - Appointment Accepted${bookingId ? ` (${bookingId})` : ''}`
+    : `Aura Salon - Appointment Declined${bookingId ? ` (${bookingId})` : ''}`;
 
   const safeName = String(booking.name || 'Customer').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const safeService = serviceName.replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const safeBookingId = bookingId.replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const safeDateTime = `${date}${time ? ` at ${time}` : ''}`.trim();
 
-  const acceptedText = `Hi ${booking.name || 'Customer'},\n\nCEO Unisex Salon has ACCEPTED your appointment.\n\nService: ${serviceName}\nBooking Code: ${bookingCode}\nBooking ID: ${bookingId || 'N/A'}\nScheduled for: ${safeDateTime || 'N/A'}\n\nYour service will be rendered on the due date/time as requested in your booking.\n\nIf you need to reschedule, please reply to this email or contact the salon.\n\nThank you for choosing CEO Unisex Salon.`;
-  const declinedText = `Hi ${booking.name || 'Customer'},\n\nCEO Unisex Salon has DECLINED your appointment.\n\nService: ${serviceName}\nBooking Code: ${bookingCode}\nBooking ID: ${bookingId || 'N/A'}\nScheduled for: ${safeDateTime || 'N/A'}\n\n${isPaidBooking ? `${refundStatementText}\n\n` : ''}Please contact the salon if you believe this was a mistake or to book another date/time.\n\nThank you.`;
+  const acceptedText = `Hi ${booking.name || 'Customer'},\n\nAura Salon has ACCEPTED your appointment.\n\nService: ${serviceName}\nBooking Code: ${bookingCode}\nBooking ID: ${bookingId || 'N/A'}\nScheduled for: ${safeDateTime || 'N/A'}\n\nYour service will be rendered on the due date/time as requested in your booking.\n\nIf you need to reschedule, please reply to this email or contact the salon.\n\nThank you for choosing Aura Salon.`;
+  const declinedText = `Hi ${booking.name || 'Customer'},\n\nAura Salon has DECLINED your appointment.\n\nService: ${serviceName}\nBooking Code: ${bookingCode}\nBooking ID: ${bookingId || 'N/A'}\nScheduled for: ${safeDateTime || 'N/A'}\n\n${isPaidBooking ? `${refundStatementText}\n\n` : ''}Please contact the salon if you believe this was a mistake or to book another date/time.\n\nThank you.`;
 
   const html = next === 'approved'
     ? `
       <div style="margin:0; padding:24px; background:#f4fff8; font-family:'Segoe UI', Arial, sans-serif; line-height:1.5; color:#1f2d23;">
         <div style="max-width:620px; margin:0 auto; border-radius:18px; overflow:hidden; border:1px solid #cdeed8; background:#ffffff; box-shadow:0 12px 28px rgba(15,107,47,.12);">
           <div style="padding:20px 24px; background:linear-gradient(135deg,#0f6b2f 0%,#1e9d53 55%,#55c786 100%); color:#ffffff;">
-            <div style="font-size:13px; opacity:.96; text-transform:uppercase; letter-spacing:.4px;">CEO Unisex Salon</div>
+            <div style="font-size:13px; opacity:.96; text-transform:uppercase; letter-spacing:.4px;">Aura Salon</div>
             <h2 style="margin:8px 0 0; font-size:24px; line-height:1.2;">✅ Appointment Accepted</h2>
           </div>
           <div style="padding:24px;">
@@ -461,7 +602,7 @@ async function maybeSendBookingStatusEmail({ booking, previousStatus, newStatus 
       <div style="margin:0; padding:24px; background:#fff6f8; font-family:'Segoe UI', Arial, sans-serif; line-height:1.5; color:#3b2430;">
         <div style="max-width:620px; margin:0 auto; border-radius:18px; overflow:hidden; border:1px solid #f2cfdb; background:#ffffff; box-shadow:0 12px 28px rgba(176,0,32,.12);">
           <div style="padding:20px 24px; background:linear-gradient(135deg,#b00020 0%,#d81b60 55%,#ff6f91 100%); color:#ffffff;">
-            <div style="font-size:13px; opacity:.96; text-transform:uppercase; letter-spacing:.4px;">CEO Unisex Salon</div>
+            <div style="font-size:13px; opacity:.96; text-transform:uppercase; letter-spacing:.4px;">Aura Salon</div>
             <h2 style="margin:8px 0 0; font-size:24px; line-height:1.2;">❌ Appointment Declined</h2>
           </div>
           <div style="padding:24px;">
@@ -702,7 +843,7 @@ async function maybeSendBookingTrackingCodeEmail({ booking }) {
   const when = `${String(booking.date || '').trim()}${String(booking.time || '').trim() ? ` at ${String(booking.time || '').trim()}` : ''}`.trim() || 'N/A';
 
   const subject = `Your Booking Tracking Code - ${trackingCode}`;
-  const text = `Hi ${booking.name || 'Customer'},\n\nYour booking was received successfully.\n\nTracking Code: ${trackingCode}\nBooking ID: ${bookingId || 'N/A'}\nService: ${serviceName}\nScheduled for: ${when}\n\nUse your tracking code + booking email on our website to check if your booking is approved or declined.\n\nThank you for choosing CEO Unisex Salon.`;
+  const text = `Hi ${booking.name || 'Customer'},\n\nYour booking was received successfully.\n\nTracking Code: ${trackingCode}\nBooking ID: ${bookingId || 'N/A'}\nService: ${serviceName}\nScheduled for: ${when}\n\nUse your tracking code + booking email on our website to check if your booking is approved or declined.\n\nThank you for choosing Aura Salon.`;
 
   const html = buildColorfulEmailShell({
     title: '🔎 Booking Tracking Code',
@@ -810,7 +951,7 @@ async function maybeSendProductOrderStatusEmail({ order, previousStatus, newStat
       label: 'Cancelled',
       emoji: '❌',
       accent: '#d81b60',
-      subtitle: 'Order update from CEO Unisex Salon.',
+      subtitle: 'Order update from Aura Salon.',
       body: 'Your product order was cancelled. Please contact us if you need assistance or want to reorder.'
     }
   };
@@ -822,7 +963,7 @@ async function maybeSendProductOrderStatusEmail({ order, previousStatus, newStat
     : 'N/A';
 
   const subject = `${meta.emoji} Product Order ${meta.label} - ${orderCode}`;
-  const text = `Hi ${customerName},\n\n${meta.body}\n\nOrder Code: ${orderCode}\nStatus: ${meta.label}\nItems: ${itemsText}\nTotal: ₦${Number(order.totalAmount || 0).toLocaleString()}\n\nThank you for choosing CEO Unisex Salon.`;
+  const text = `Hi ${customerName},\n\n${meta.body}\n\nOrder Code: ${orderCode}\nStatus: ${meta.label}\nItems: ${itemsText}\nTotal: ₦${Number(order.totalAmount || 0).toLocaleString()}\n\nThank you for choosing Aura Salon.`;
 
   const html = buildColorfulEmailShell({
     title: `${meta.emoji} Product Order ${meta.label}`,
@@ -907,7 +1048,7 @@ async function maybeSendBookingInvoiceEmail({ booking }) {
   const openBookingInvoiceButtonHtml = buildEmailActionButton({ href: secureInvoiceUrl, label: 'Open secure online invoice', bg: '#1d4ed8' });
 
   const subject = `Service Invoice - ${invoiceNo}`;
-  const text = `Hi ${customerName},\n\nHere is your service invoice from CEO Unisex Salon.\n\nInvoice No: ${invoiceNo}\nBooking ID: ${bookingId || 'N/A'}\nTracking Code: ${trackingCode}\nService: ${serviceName}\nScheduled: ${when}\nPayment Method: ${paymentMethod}\nPayment Plan: ${paymentPlan}\nService Subtotal: ₦${subtotal.toLocaleString()}\nProducts Total: ₦${productsTotal.toLocaleString()}\nTotal: ₦${total.toLocaleString()}\nAmount Due Now: ₦${dueNow.toLocaleString()}\nAmount Remaining: ₦${remaining.toLocaleString()}\nOnline Invoice: ${secureInvoiceUrl}\n\nThank you for choosing CEO Unisex Salon.`;
+  const text = `Hi ${customerName},\n\nHere is your service invoice from Aura Salon.\n\nInvoice No: ${invoiceNo}\nBooking ID: ${bookingId || 'N/A'}\nTracking Code: ${trackingCode}\nService: ${serviceName}\nScheduled: ${when}\nPayment Method: ${paymentMethod}\nPayment Plan: ${paymentPlan}\nService Subtotal: ₦${subtotal.toLocaleString()}\nProducts Total: ₦${productsTotal.toLocaleString()}\nTotal: ₦${total.toLocaleString()}\nAmount Due Now: ₦${dueNow.toLocaleString()}\nAmount Remaining: ₦${remaining.toLocaleString()}\nOnline Invoice: ${secureInvoiceUrl}\n\nThank you for choosing Aura Salon.`;
 
   const pdfBuffer = await buildInvoicePdfBuffer({
     invoiceTitle: 'Service Invoice',
@@ -1021,7 +1162,7 @@ async function maybeSendProductOrderInvoiceEmail({ order }) {
     : 'No item lines';
 
   const subject = `Product Order Invoice - ${invoiceNo}`;
-  const text = `Hi ${customerName},\n\nHere is your product order invoice from CEO Unisex Salon.\n\nInvoice No: ${invoiceNo}\nOrder Code: ${orderCode}\nOrder ID: ${orderId || 'N/A'}\nPayment Method: ${paymentMethod}\nDelivery Speed: ${deliverySpeed}\n\nItems:\n${itemsText}\n\nSubtotal: ₦${subtotal.toLocaleString()}\nDelivery Fee: ₦${deliveryFee.toLocaleString()}\nTotal: ₦${total.toLocaleString()}\nAmount Due Now: ₦${amountDueNow.toLocaleString()}\nOnline Invoice: ${secureInvoiceUrl}\n\nThank you for shopping with CEO Unisex Salon.`;
+  const text = `Hi ${customerName},\n\nHere is your product order invoice from Aura Salon.\n\nInvoice No: ${invoiceNo}\nOrder Code: ${orderCode}\nOrder ID: ${orderId || 'N/A'}\nPayment Method: ${paymentMethod}\nDelivery Speed: ${deliverySpeed}\n\nItems:\n${itemsText}\n\nSubtotal: ₦${subtotal.toLocaleString()}\nDelivery Fee: ₦${deliveryFee.toLocaleString()}\nTotal: ₦${total.toLocaleString()}\nAmount Due Now: ₦${amountDueNow.toLocaleString()}\nOnline Invoice: ${secureInvoiceUrl}\n\nThank you for shopping with Aura Salon.`;
 
   const pdfBuffer = await buildInvoicePdfBuffer({
     invoiceTitle: 'Product Order Invoice',
@@ -1162,8 +1303,8 @@ async function maybeSendBookingStatusSms({ booking, previousStatus, newStatus })
   const isPaidBooking = isBookingPaidForRefundNotice(booking);
 
   const message = next === 'approved'
-    ? `CEO Unisex Salon: Appointment ACCEPTED. ${serviceName}. ${when ? `Due: ${when}. ` : ''}Booking Code: ${bookingCode}. ${bookingId ? `Booking ID: ${bookingId}. ` : ''}Service will be rendered on the due date/time as requested.`
-    : `CEO Unisex Salon: Appointment DECLINED. ${serviceName}. ${when ? `Due: ${when}. ` : ''}Booking Code: ${bookingCode}. ${bookingId ? `Booking ID: ${bookingId}. ` : ''}${isPaidBooking ? 'A refund will be processed within 3 to 7 business days (timelines may vary by bank). ' : ''}Please contact the salon to reschedule.`;
+    ? `Aura Salon: Appointment ACCEPTED. ${serviceName}. ${when ? `Due: ${when}. ` : ''}Booking Code: ${bookingCode}. ${bookingId ? `Booking ID: ${bookingId}. ` : ''}Service will be rendered on the due date/time as requested.`
+    : `Aura Salon: Appointment DECLINED. ${serviceName}. ${when ? `Due: ${when}. ` : ''}Booking Code: ${bookingCode}. ${bookingId ? `Booking ID: ${bookingId}. ` : ''}${isPaidBooking ? 'A refund will be processed within 3 to 7 business days (timelines may vary by bank). ' : ''}Please contact the salon to reschedule.`;
 
   const smsResult = await sendSmsViaTermii({ to, message });
 
@@ -1394,7 +1535,7 @@ const dbPath = IS_VERCEL_RUNTIME
   ? path.join('/tmp', 'database.json')
   : packagedDbPath;
 const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
-const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || 'ceo_unisex_salon').trim();
+const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || 'aura_salon').trim();
 const MONGODB_STATE_COLLECTION = String(process.env.MONGODB_STATE_COLLECTION || 'app_state').trim();
 const MONGODB_STATE_DOCUMENT_ID = 'primary';
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
@@ -2238,7 +2379,7 @@ function sortProductsForDisplay(products) {
 
 function buildBankTransferReference(bookingId) {
   const shortId = String(bookingId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase();
-  return `CEOSALOON-${shortId || 'BOOKING'}`;
+  return `AURASALON-${shortId || 'BOOKING'}`;
 }
 
 function buildBookingStatusCode(bookingId) {
@@ -2598,7 +2739,7 @@ function getPublicBaseUrlForRequest(req) {
 }
 
 function buildColorfulEmailShell({ title, subtitle, bodyHtml, accent = '#8f2aa8' }) {
-  const safeTitle = escapeHtml(title || 'CEO Unisex Salon');
+  const safeTitle = escapeHtml(title || 'Aura Salon');
   const safeSubtitle = escapeHtml(subtitle || 'Professional beauty services');
   const safeAccent = escapeHtml(String(accent || '#8f2aa8'));
 
@@ -2620,7 +2761,7 @@ function buildColorfulEmailShell({ title, subtitle, bodyHtml, accent = '#8f2aa8'
       </style>
       <div class="ceo-email-card" style="max-width:700px; margin:0 auto; border-radius:18px; overflow:hidden; border:1px solid #e5e7eb; background:#ffffff; box-shadow:0 16px 36px rgba(15,23,42,.10);">
         <div class="ceo-email-header" style="padding:20px 24px; background:linear-gradient(135deg,#1f2937 0%,${safeAccent} 58%,#ec4899 100%); color:#ffffff;">
-          <div style="font-size:12px; letter-spacing:.6px; text-transform:uppercase; opacity:.96; font-weight:600;">CEO Unisex Salon</div>
+          <div style="font-size:12px; letter-spacing:.6px; text-transform:uppercase; opacity:.96; font-weight:600;">Aura Salon</div>
           <h2 style="margin:8px 0 4px; font-size:24px; line-height:1.25; font-weight:700;">${safeTitle}</h2>
           <div style="font-size:13px; opacity:.94;">${safeSubtitle}</div>
         </div>
@@ -2628,7 +2769,7 @@ function buildColorfulEmailShell({ title, subtitle, bodyHtml, accent = '#8f2aa8'
           ${bodyHtml || ''}
         </div>
         <div class="ceo-email-footer" style="padding:12px 24px 18px; font-size:12px; color:#6b7280; border-top:1px solid #f3f4f6; background:#fcfcfd;">
-          This is an automated message from CEO Unisex Salon. If you need help, please contact support.
+          This is an automated message from Aura Salon. If you need help, please contact support.
         </div>
       </div>
     </div>
@@ -2677,7 +2818,7 @@ function buildInvoicePdfBuffer({
       const contentWidth = right - left;
 
       doc.roundedRect(left, 44, contentWidth, 78, 10).fillAndStroke('#f8fafc', '#e5e7eb');
-      doc.fillColor('#1f2937').fontSize(20).text('CEO Unisex Salon', left + 16, 60, { width: contentWidth - 32 });
+      doc.fillColor('#1f2937').fontSize(20).text('Aura Salon', left + 16, 60, { width: contentWidth - 32 });
       doc.fillColor('#374151').fontSize(14).text(String(invoiceTitle || 'Invoice'), left + 16, 86, { width: contentWidth - 32 });
 
       doc.fillColor('#111827').fontSize(10);
@@ -2723,7 +2864,7 @@ function buildInvoicePdfBuffer({
 
       y += 10;
       doc.roundedRect(left, y, contentWidth, 34, 8).fillAndStroke('#f0fdf4', '#bbf7d0');
-      doc.fillColor('#166534').fontSize(10).text('Thank you for choosing CEO Unisex Salon.', left + 12, y + 11, {
+      doc.fillColor('#166534').fontSize(10).text('Thank you for choosing Aura Salon.', left + 12, y + 11, {
         width: contentWidth - 24
       });
 
@@ -3145,7 +3286,7 @@ app.post('/api/product-orders', async (req, res) => {
   };
 
   if (normalizedPaymentMethod === 'Bank Transfer') {
-    order.bankTransferReference = `CEOSALOON-PROD-${String(order.id).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase()}`;
+    order.bankTransferReference = `AURASALON-PROD-${String(order.id).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase()}`;
   }
 
   db.productOrders.push(order);
@@ -3649,7 +3790,7 @@ app.post('/api/grok/chat', async (req, res) => {
     const messages = [
       {
         role: 'system',
-        content: 'You are the helpful virtual assistant for CEO Unisex Salon. Keep answers concise, friendly, and booking-focused.'
+        content: 'You are the helpful virtual assistant for Aura Salon. Keep answers concise, friendly, and booking-focused.'
       },
       ...priorMessages,
       { role: 'user', content: message }
@@ -4368,7 +4509,7 @@ app.post('/api/payments/monnify/initialize', async (req, res) => {
   }
 
   const redirectUrl = `${PUBLIC_BASE_URL}/monnify-callback.html`;
-  const generatedPaymentReference = `CEOSALOON-${String(booking.id).slice(0, 12)}-${Date.now()}`;
+  const generatedPaymentReference = `AURASALON-${String(booking.id).slice(0, 12)}-${Date.now()}`;
 
   const normalizedPaymentMethods = Array.isArray(paymentMethods)
     ? paymentMethods
@@ -4382,7 +4523,7 @@ app.post('/api/payments/monnify/initialize', async (req, res) => {
       customerName: booking.name,
       customerEmail: booking.email,
       paymentReference: generatedPaymentReference,
-      paymentDescription: `CEO UNISEX SALON - ${booking.serviceName}`,
+      paymentDescription: `AURA SALON - ${booking.serviceName}`,
       currencyCode: 'NGN',
       contractCode: String(MONNIFY_CONTRACT_CODE || '').trim(),
       redirectUrl,
@@ -5544,9 +5685,9 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
     const serviceName = String(booking.serviceName || 'your appointment').trim();
     const customerName = String(booking.name || 'Customer').trim();
 
-    const smsText = `Hi ${customerName}, your booking assignment is ready. Staff: ${staff}. Chair: ${chair}. Service: ${serviceName}. Time: ${safeWhen}. - CEO Unisex Salon`;
+    const smsText = `Hi ${customerName}, your booking assignment is ready. Staff: ${staff}. Chair: ${chair}. Service: ${serviceName}. Time: ${safeWhen}. - Aura Salon`;
     const emailSubject = `Booking assignment update${booking.id ? ` (${booking.id})` : ''}`;
-    const emailText = `Hi ${customerName},\n\nYour booking assignment is ready.\n\nService: ${serviceName}\nAssigned staff: ${staff}\nAssigned chair: ${chair}\nScheduled: ${safeWhen}\n\nIf this timing no longer works, kindly contact the salon for support.\n\nCEO Unisex Salon`;
+    const emailText = `Hi ${customerName},\n\nYour booking assignment is ready.\n\nService: ${serviceName}\nAssigned staff: ${staff}\nAssigned chair: ${chair}\nScheduled: ${safeWhen}\n\nIf this timing no longer works, kindly contact the salon for support.\n\nAura Salon`;
     const emailHtml = buildColorfulEmailShell({
       title: '👩‍💼 Booking Assignment Update',
       subtitle: 'Your staff and chair have been assigned',
@@ -5644,7 +5785,9 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       chair,
       date: resolvedDate,
       time: resolvedTime,
-      notifiedAt: assignmentLog.createdAt
+      notifiedAt: assignmentLog.createdAt,
+      autoApproved: false,
+      autoApprovedAt: ''
     };
 
     const bookingStatusMap = {
@@ -5716,6 +5859,17 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       }
     }
 
+    booking.lastAssignment = {
+      ...(booking.lastAssignment || {}),
+      staff,
+      chair,
+      date: resolvedDate,
+      time: resolvedTime,
+      notifiedAt: assignmentLog.createdAt,
+      autoApproved,
+      autoApprovedAt: autoApproved ? assignmentLog.createdAt : ''
+    };
+
     pushAuditLog(db, {
       actor: toPublicAdmin(req.admin),
       action: 'notify_booking_assignment',
@@ -5744,7 +5898,9 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
         staff,
         chair,
         date: resolvedDate,
-        time: resolvedTime
+        time: resolvedTime,
+        autoApproved,
+        autoApprovedAt: autoApproved ? assignmentLog.createdAt : ''
       },
       notifications: {
         sms: smsResult,
@@ -6280,7 +6436,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     }
 
     try {
-      const subject = 'CEO Unisex Salon Admin OTP Code';
+      const subject = 'Aura Salon Admin OTP Code';
       const text = `${otpMessage}\n\nThis code expires in 10 minutes. If you did not request this, ignore this message.`;
       const decoratedCode = String(accessCode || '')
         .split('')
@@ -6290,7 +6446,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
         <div style="margin:0; padding:24px; background:#f7f2ff; font-family:'Segoe UI', Arial, sans-serif; line-height:1.5; color:#2f2340;">
           <div style="max-width:620px; margin:0 auto; border-radius:18px; overflow:hidden; border:1px solid #ead6ff; background:#ffffff; box-shadow:0 12px 28px rgba(74,14,78,.12);">
             <div style="padding:22px 24px; background:linear-gradient(135deg,#5c1b66 0%,#8f2aa8 45%,#ff5fa2 100%); color:#ffffff;">
-              <div style="font-size:13px; opacity:.95; letter-spacing:.4px; text-transform:uppercase;">CEO Unisex Salon</div>
+              <div style="font-size:13px; opacity:.95; letter-spacing:.4px; text-transform:uppercase;">Aura Salon</div>
               <h2 style="margin:8px 0 0; font-size:24px; line-height:1.2;">Admin Login OTP</h2>
             </div>
 
@@ -6673,7 +6829,7 @@ function startServerWithPortFallback(index = 0) {
       PUBLIC_BASE_URL = `http://localhost:${ACTIVE_PORT}`;
     }
 
-    console.log(`CEO UNISEX SALON Server running at http://localhost:${ACTIVE_PORT}`);
+    console.log(`AURA SALON Server running at http://localhost:${ACTIVE_PORT}`);
     if (index > 0) {
       console.log(`ℹ️  Auto-picked fallback port ${ACTIVE_PORT}.`);
     }

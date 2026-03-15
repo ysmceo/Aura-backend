@@ -1,5 +1,5 @@
 @echo off
-echo Starting CEO SALOON Server...
+echo Starting Aura Salon Server...
 echo.
 if "%PORT%"=="" set PORT=3000
 echo The server will run on http://localhost:%PORT%
