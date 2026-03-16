@@ -1436,14 +1436,40 @@ function mergeProductDefaults(existingProducts) {
 
 // Use a configurable writable uploads directory for Render/persistent disks.
 const configuredUploadsDir = String(process.env.UPLOADS_DIR || '').trim();
-const uploadsDir = configuredUploadsDir
+const preferredUploadsDir = configuredUploadsDir
   ? path.resolve(configuredUploadsDir)
   : IS_VERCEL_RUNTIME
     ? path.join('/tmp', 'uploads')
     : FRONTEND_UPLOADS_DIR;
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+
+function resolveWritableUploadsDir(preferredDir) {
+  const candidates = [
+    preferredDir,
+    path.join('/tmp', 'uploads'),
+    FRONTEND_UPLOADS_DIR
+  ].filter((value, index, arr) => {
+    const normalized = String(value || '').trim();
+    return normalized && arr.indexOf(value) === index;
+  });
+
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    try {
+      fs.mkdirSync(candidate, { recursive: true });
+      fs.accessSync(candidate, fs.constants.W_OK);
+      return candidate;
+    } catch (error) {
+      lastError = error;
+      const reason = error && error.code ? String(error.code) : 'unknown_error';
+      console.warn(`[Uploads] Cannot use "${candidate}" (${reason}). Trying fallback...`);
+    }
+  }
+
+  throw lastError || new Error('No writable uploads directory available');
 }
+
+const uploadsDir = resolveWritableUploadsDir(preferredUploadsDir);
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
