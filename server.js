@@ -139,6 +139,7 @@ const PAYMENT_RECEIPTS_BCC = process.env.PAYMENT_RECEIPTS_BCC || '';
 const SEND_ADMIN_LOGIN_OTP_EMAILS = String(process.env.SEND_ADMIN_LOGIN_OTP_EMAILS || 'true').trim().toLowerCase() === 'true';
 const SEND_ADMIN_LOGIN_OTP_SMS = String(process.env.SEND_ADMIN_LOGIN_OTP_SMS || 'true').trim().toLowerCase() === 'true';
 const ALLOW_ADMIN_OTP_RESPONSE_FALLBACK = String(process.env.ALLOW_ADMIN_OTP_RESPONSE_FALLBACK || 'true').trim().toLowerCase() === 'true';
+const ADMIN_LOGIN_OTP_EMAIL_OVERRIDE = normalizeEmail(process.env.ADMIN_LOGIN_OTP_EMAIL_OVERRIDE || '');
 const ADMIN_OTP_DELIVERY_TIMEOUT_MS = Number(process.env.ADMIN_OTP_DELIVERY_TIMEOUT_MS) > 0
   ? Number(process.env.ADMIN_OTP_DELIVERY_TIMEOUT_MS)
   : 8000;
@@ -191,12 +192,17 @@ function normalizePhoneToE164(phone) {
 }
 
 function isSmtpConfigured() {
+  const smtpUser = String(SMTP_USER || '').trim();
+  const smtpPass = String(SMTP_PASS || '').trim();
+  const placeholderPattern = /(replace_with|your_|example\.com|smtp_password|app_password)/i;
+  const hasRealUser = Boolean(smtpUser) && !placeholderPattern.test(smtpUser);
+  const hasRealPass = Boolean(smtpPass) && !placeholderPattern.test(smtpPass);
   const hasService = Boolean(String(SMTP_SERVICE || '').trim());
   const hasHost = Boolean(String(SMTP_HOST || '').trim());
   return Boolean(hasService || hasHost) &&
     Boolean(Number.isFinite(SMTP_PORT) && SMTP_PORT > 0) &&
-    Boolean(String(SMTP_USER || '').trim()) &&
-    Boolean(String(SMTP_PASS || '').trim());
+    hasRealUser &&
+    hasRealPass;
 }
 
 function isGmailHostConfigured() {
@@ -4945,14 +4951,22 @@ app.get('/api/bookings/track', (req, res) => {
     .filter(n => String(n.bookingId) === String(booking.id))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
+  const bookingStatusAliases = {
+    accepted: 'approved',
+    declined: 'cancelled'
+  };
+  const bookingStatusRaw = String(booking.status || '').trim().toLowerCase();
+  const normalizedBookingStatus = bookingStatusAliases[bookingStatusRaw] || bookingStatusRaw || 'pending';
+
   res.json({
     booking: {
       id: booking.id,
       trackingCode: booking.trackingCode,
-      status: booking.status,
+      status: normalizedBookingStatus,
       serviceName: booking.serviceName,
       date: booking.date,
       time: booking.time,
+      selectedStaff: booking.selectedStaff,
       price: booking.price,
       paymentMethod: booking.paymentMethod,
       paymentPlan: booking.paymentPlan,
@@ -4966,7 +4980,9 @@ app.get('/api/bookings/track', (req, res) => {
       paymentReceiptFile: booking.paymentReceiptFile || null,
       paymentReceiptStatus: booking.paymentReceiptStatus || '',
       serviceMode: booking.serviceMode,
-      homeServiceAddress: booking.homeServiceAddress
+      homeServiceAddress: booking.homeServiceAddress,
+      refreshment: booking.refreshment || 'No',
+      specialRequests: booking.specialRequests || ''
     },
     notifications
   });
@@ -5003,14 +5019,22 @@ app.get('/api/bookings/:id/track', (req, res) => {
     .filter(n => String(n.bookingId) === String(booking.id))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
+  const bookingStatusAliases = {
+    accepted: 'approved',
+    declined: 'cancelled'
+  };
+  const bookingStatusRaw = String(booking.status || '').trim().toLowerCase();
+  const normalizedBookingStatus = bookingStatusAliases[bookingStatusRaw] || bookingStatusRaw || 'pending';
+
   res.json({
     booking: {
       id: booking.id,
       trackingCode: booking.trackingCode,
-      status: booking.status,
+      status: normalizedBookingStatus,
       serviceName: booking.serviceName,
       date: booking.date,
       time: booking.time,
+      selectedStaff: booking.selectedStaff,
       price: booking.price,
       paymentMethod: booking.paymentMethod,
       paymentPlan: booking.paymentPlan,
@@ -5024,7 +5048,9 @@ app.get('/api/bookings/:id/track', (req, res) => {
       paymentReceiptFile: booking.paymentReceiptFile || null,
       paymentReceiptStatus: booking.paymentReceiptStatus || '',
       serviceMode: booking.serviceMode,
-      homeServiceAddress: booking.homeServiceAddress
+      homeServiceAddress: booking.homeServiceAddress,
+      refreshment: booking.refreshment || 'No',
+      specialRequests: booking.specialRequests || ''
     },
     notifications
   });
@@ -6578,6 +6604,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     email: { attempted: false, sent: false, skipped: false, reason: '' },
     sms: { attempted: false, sent: false, skipped: false, reason: '' }
   };
+  const otpEmailRecipient = ADMIN_LOGIN_OTP_EMAIL_OVERRIDE || normalizeEmail(admin.email);
 
   async function withTimeout(promiseFactory, timeoutMs) {
     let timeoutHandle;
@@ -6643,7 +6670,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 
       await withTimeout(
         () => sendEmail({
-          to: normalizeEmail(admin.email),
+          to: otpEmailRecipient,
           subject,
           text,
           html
@@ -6705,9 +6732,24 @@ app.post('/api/admin/request-login-access', async (req, res) => {
       fallbackToResponse = true;
       deliveredBy.push('response');
     } else {
+      const channelLabels = [];
+      if (SEND_ADMIN_LOGIN_OTP_EMAILS) channelLabels.push('email');
+      if (SEND_ADMIN_LOGIN_OTP_SMS) channelLabels.push('phone');
+      const channelText = channelLabels.length > 1
+        ? channelLabels.join('/')
+        : (channelLabels[0] || 'configured channels');
+
+      const hintParts = [];
+      if (SEND_ADMIN_LOGIN_OTP_EMAILS) {
+        hintParts.push('Configure SMTP_USER and SMTP_PASS (App Password for Gmail) to enable admin OTP email delivery.');
+      }
+      if (SEND_ADMIN_LOGIN_OTP_SMS) {
+        hintParts.push('Configure Termii + admin phone to enable OTP SMS delivery.');
+      }
+
       return res.status(503).json({
-        error: 'Failed to deliver OTP to admin email/phone',
-        hint: 'Configure SMTP for email OTP and/or Termii + admin phone for SMS OTP.',
+        error: `Failed to deliver OTP to admin ${channelText}`,
+        hint: hintParts.join(' '),
         delivery
       });
     }
@@ -6733,6 +6775,9 @@ app.post('/api/admin/request-login-access', async (req, res) => {
       : 'One-time access code generated successfully',
     expiresInMinutes: 10,
     deliveredBy: deliveredBy.length ? deliveredBy : ['response'],
+    deliveryTargets: {
+      email: otpEmailRecipient || null
+    },
     delivery,
     // Backward-compatibility fallback when secure OTP channels are disabled,
     // or when channel delivery fails and response fallback is enabled.
