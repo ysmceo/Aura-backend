@@ -127,7 +127,9 @@ const EMAIL_QUEUE_CONCURRENCY = Number(process.env.EMAIL_QUEUE_CONCURRENCY) > 0
   ? Math.min(6, Math.max(1, Number(process.env.EMAIL_QUEUE_CONCURRENCY)))
   : 1;
 const SEND_PAYMENT_EMAIL_RECEIPTS = String(process.env.SEND_PAYMENT_EMAIL_RECEIPTS || 'false').trim().toLowerCase() === 'true';
-const SEND_BOOKING_STATUS_EMAILS = String(process.env.SEND_BOOKING_STATUS_EMAILS || 'false').trim().toLowerCase() === 'true';
+const SEND_BOOKING_STATUS_EMAILS = String(process.env.SEND_BOOKING_STATUS_EMAILS || 'true').trim().toLowerCase() === 'true';
+const SEND_BOOKING_CREATED_EMAILS = String(process.env.SEND_BOOKING_CREATED_EMAILS || 'true').trim().toLowerCase() === 'true';
+const SEND_BOOKING_RESCHEDULE_EMAILS = String(process.env.SEND_BOOKING_RESCHEDULE_EMAILS || 'true').trim().toLowerCase() === 'true';
 const SEND_ADMIN_NEW_BOOKING_EMAILS = String(process.env.SEND_ADMIN_NEW_BOOKING_EMAILS || 'false').trim().toLowerCase() === 'true';
 const SEND_BOOKING_TRACKING_CODE_EMAILS = String(process.env.SEND_BOOKING_TRACKING_CODE_EMAILS || 'true').trim().toLowerCase() === 'true';
 const SEND_PRODUCT_ORDER_STATUS_EMAILS = String(process.env.SEND_PRODUCT_ORDER_STATUS_EMAILS || 'true').trim().toLowerCase() === 'true';
@@ -644,6 +646,143 @@ async function maybeSendBookingStatusEmail({ booking, previousStatus, newStatus 
   }
   booking.bookingStatusEmailTo = toEmail;
   booking.bookingStatusEmailLastMessageId = info && info.messageId ? info.messageId : undefined;
+
+  return { sent: true };
+}
+
+async function maybeSendBookingCreatedEmail({ booking }) {
+  if (!SEND_BOOKING_CREATED_EMAILS) {
+    return { sent: false, skipped: true, reason: 'SEND_BOOKING_CREATED_EMAILS=false' };
+  }
+
+  if (!isSmtpConfigured()) {
+    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  }
+
+  if (!booking || !booking.email) {
+    return { sent: false, skipped: true, reason: 'Missing booking/email' };
+  }
+
+  if (booking.bookingCreatedEmailSentAt) {
+    return { sent: false, skipped: true, reason: 'Already sent' };
+  }
+
+  const toEmail = normalizeEmail(booking.email);
+  const customerName = String(booking.name || 'Customer').trim();
+  const bookingId = String(booking.id || '').trim();
+  const bookingCode = buildBookingStatusCode(bookingId);
+  const trackingCode = getBookingTrackingCode(booking);
+  const serviceName = String(booking.serviceName || 'Salon Service').trim();
+  const when = `${String(booking.date || '').trim()}${String(booking.time || '').trim() ? ` at ${String(booking.time || '').trim()}` : ''}`.trim() || 'N/A';
+  const amountDueNow = Number(booking.amountDueNow || 0);
+  const paymentMethod = String(booking.paymentMethod || 'N/A').trim();
+  const paymentPlan = String(booking.paymentPlan || 'N/A').trim();
+
+  const subject = `Booking Received - ${bookingCode}${bookingId ? ` (${bookingId})` : ''}`;
+  const text = `Hi ${customerName},\n\nYour booking has been received successfully.\n\nBooking Code: ${bookingCode}\nTracking Code: ${trackingCode}\nBooking ID: ${bookingId || 'N/A'}\nService: ${serviceName}\nScheduled for: ${when}\nPayment Method: ${paymentMethod}\nPayment Plan: ${paymentPlan}\nAmount Due Now: ₦${amountDueNow.toLocaleString()}\n\nWe will contact you via your provided email/phone, and you can also track status using your tracking code.\n\nThank you for choosing Aura Salon.`;
+
+  const html = buildColorfulEmailShell({
+    title: '🎉 Booking Received',
+    subtitle: 'Your appointment request has been created successfully',
+    accent: '#2b6ef2',
+    bodyHtml: `
+      <p style="margin:0 0 10px; font-size:15px;">Hi <strong>${escapeHtml(customerName)}</strong>,</p>
+      <p style="margin:0 0 14px; color:#374151; font-size:14px;">Your booking request has been received. You can track progress anytime with your tracking code.</p>
+      <div style="padding:14px; border:1px solid #dbeafe; border-radius:12px; background:#eff6ff;">
+        <div><strong>Booking Code:</strong> ${escapeHtml(bookingCode)}</div>
+        <div><strong>Tracking Code:</strong> <span style="font-family:monospace;">${escapeHtml(trackingCode)}</span></div>
+        <div><strong>Booking ID:</strong> ${escapeHtml(bookingId || 'N/A')}</div>
+        <div><strong>Service:</strong> ${escapeHtml(serviceName)}</div>
+        <div><strong>Scheduled for:</strong> ${escapeHtml(when)}</div>
+        <div><strong>Payment Method:</strong> ${escapeHtml(paymentMethod)}</div>
+        <div><strong>Payment Plan:</strong> ${escapeHtml(paymentPlan)}</div>
+        <div><strong>Amount Due Now:</strong> ₦${amountDueNow.toLocaleString()}</div>
+      </div>
+      <p style="margin:12px 0 0; color:#6a5c80; font-size:13px;">If your booking is approved, you'll get another confirmation email automatically.</p>
+    `
+  });
+
+  const info = await sendEmail({
+    to: toEmail,
+    subject,
+    text,
+    html
+  });
+
+  booking.bookingCreatedEmailSentAt = new Date().toISOString();
+  booking.bookingCreatedEmailTo = toEmail;
+  booking.bookingCreatedEmailMessageId = info && info.messageId ? info.messageId : undefined;
+
+  return { sent: true };
+}
+
+async function maybeSendBookingRescheduledEmail({ booking, previousDate, previousTime, newDate, newTime, previousStaff, newStaff }) {
+  if (!SEND_BOOKING_RESCHEDULE_EMAILS) {
+    return { sent: false, skipped: true, reason: 'SEND_BOOKING_RESCHEDULE_EMAILS=false' };
+  }
+
+  if (!isSmtpConfigured()) {
+    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  }
+
+  if (!booking || !booking.email) {
+    return { sent: false, skipped: true, reason: 'Missing booking/email' };
+  }
+
+  const prevDate = String(previousDate || '').trim();
+  const prevTime = String(previousTime || '').trim();
+  const nextDate = String(newDate || '').trim();
+  const nextTime = String(newTime || '').trim();
+  const before = `${prevDate}${prevTime ? ` at ${prevTime}` : ''}`.trim();
+  const after = `${nextDate}${nextTime ? ` at ${nextTime}` : ''}`.trim();
+
+  if (!before || !after || before === after) {
+    return { sent: false, skipped: true, reason: 'No schedule change detected' };
+  }
+
+  const toEmail = normalizeEmail(booking.email);
+  const customerName = String(booking.name || 'Customer').trim();
+  const bookingId = String(booking.id || '').trim();
+  const bookingCode = buildBookingStatusCode(bookingId);
+  const serviceName = String(booking.serviceName || 'Salon Service').trim();
+
+  const staffBefore = String(previousStaff || '').trim();
+  const staffAfter = String(newStaff || '').trim();
+  const staffChanged = staffBefore && staffAfter && staffBefore.toLowerCase() !== staffAfter.toLowerCase();
+
+  const subject = `Booking Rescheduled - ${bookingCode}${bookingId ? ` (${bookingId})` : ''}`;
+  const text = `Hi ${customerName},\n\nYour booking has been rescheduled by our admin team.\n\nService: ${serviceName}\nBooking Code: ${bookingCode}\nBooking ID: ${bookingId || 'N/A'}\nPrevious Time: ${before}\nNew Time: ${after}${staffChanged ? `\nAssigned Staff: ${staffAfter}` : ''}\n\nIf this new time does not work for you, please contact the salon so we can help.\n\nAura Salon`;
+
+  const html = buildColorfulEmailShell({
+    title: '🗓️ Booking Rescheduled',
+    subtitle: 'Your appointment time has been updated',
+    accent: '#f59e0b',
+    bodyHtml: `
+      <p style="margin:0 0 10px; font-size:15px;">Hi <strong>${escapeHtml(customerName)}</strong>,</p>
+      <p style="margin:0 0 14px; color:#374151; font-size:14px;">Your booking schedule was updated by our admin team.</p>
+      <div style="padding:14px; border:1px solid #fde68a; border-radius:12px; background:#fffbeb;">
+        <div><strong>Service:</strong> ${escapeHtml(serviceName)}</div>
+        <div><strong>Booking Code:</strong> ${escapeHtml(bookingCode)}</div>
+        <div><strong>Booking ID:</strong> ${escapeHtml(bookingId || 'N/A')}</div>
+        <div><strong>Previous:</strong> ${escapeHtml(before)}</div>
+        <div><strong>New:</strong> ${escapeHtml(after)}</div>
+        ${staffChanged ? `<div><strong>Assigned Staff:</strong> ${escapeHtml(staffAfter)}</div>` : ''}
+      </div>
+      <p style="margin:12px 0 0; color:#6a5c80; font-size:13px;">If this new time does not work for you, please contact the salon.</p>
+    `
+  });
+
+  const info = await sendEmail({
+    to: toEmail,
+    subject,
+    text,
+    html
+  });
+
+  booking.bookingRescheduledEmailSentAt = new Date().toISOString();
+  booking.bookingRescheduledEmailTo = toEmail;
+  booking.bookingRescheduledEmailMessageId = info && info.messageId ? info.messageId : undefined;
+  booking.lastRescheduledAt = new Date().toISOString();
 
   return { sent: true };
 }
@@ -4127,6 +4266,7 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
   }
 
   let adminBookingEmail = null;
+  let bookingCreatedEmail = null;
   let trackingCodeEmail = null;
   let bookingInvoiceEmail = null;
   try {
@@ -4138,6 +4278,16 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
       reason: error && error.message ? String(error.message) : 'Failed to notify admins'
     };
     // Never block booking creation due to admin email errors.
+  }
+
+  try {
+    bookingCreatedEmail = await maybeSendBookingCreatedEmail({ booking });
+  } catch (error) {
+    bookingCreatedEmail = {
+      sent: false,
+      error: true,
+      reason: error && error.message ? String(error.message) : 'Failed to send booking created email'
+    };
   }
 
   try {
@@ -4184,6 +4334,7 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
       : null,
     notifications: {
       adminEmail: adminBookingEmail,
+      bookingCreatedEmail,
       trackingCodeEmail,
       invoiceEmail: bookingInvoiceEmail
     },
@@ -5747,11 +5898,42 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       return res.status(404).json({ error: 'Booking not found' });
     }
 
-    const resolvedDate = date || String(booking.date || '').trim() || 'scheduled date';
-    const resolvedTime = time || String(booking.time || '').trim() || 'scheduled time';
+    const previousDate = String(booking.date || '').trim();
+    const previousTime = String(booking.time || '').trim();
+    const previousStaff = String(booking.selectedStaff || '').trim();
+
+    const normalizedDate = String(date || '').trim() ? normalizeSlotDate(date) : '';
+    const normalizedTime = String(time || '').trim() ? normalizeSlotTime(time) : '';
+
+    if (String(date || '').trim() && !normalizedDate) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+
+    if (String(time || '').trim() && !normalizedTime) {
+      return res.status(400).json({ error: 'Invalid time format. Use HH:MM' });
+    }
+
+    const resolvedDate = normalizedDate || previousDate || 'scheduled date';
+    const resolvedTime = normalizedTime || previousTime || 'scheduled time';
     const safeWhen = `${resolvedDate} ${resolvedTime}`.trim();
     const serviceName = String(booking.serviceName || 'your appointment').trim();
     const customerName = String(booking.name || 'Customer').trim();
+    const scheduleChanged = previousDate !== resolvedDate || previousTime !== resolvedTime;
+
+    if (scheduleChanged) {
+      booking.date = resolvedDate;
+      booking.time = resolvedTime;
+      booking.updatedAt = new Date().toISOString();
+
+      addBookingNotification(
+        db,
+        booking,
+        'rescheduled',
+        `🗓️ Your booking schedule was updated from ${previousDate || 'N/A'} ${previousTime || ''} to ${resolvedDate} ${resolvedTime}.`
+      );
+    }
+
+    booking.selectedStaff = staff;
 
     const smsText = `Hi ${customerName}, your booking assignment is ready. Staff: ${staff}. Chair: ${chair}. Service: ${serviceName}. Time: ${safeWhen}. - Aura Salon`;
     const emailSubject = `Booking assignment update${booking.id ? ` (${booking.id})` : ''}`;
@@ -5869,6 +6051,7 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
     let bookingStatusEmail = { sent: false, skipped: true, reason: 'No status change from assignment notify' };
     let bookingStatusSms = { sent: false, skipped: true, reason: 'No status change from assignment notify' };
     let bookingStatusAdminEmail = { sent: false, skipped: true, reason: 'No status change from assignment notify' };
+    let bookingRescheduledEmail = { sent: false, skipped: true, reason: 'No schedule change from assignment notify' };
 
     if (['pending', 'new'].includes(previousStatus)) {
       booking.status = 'approved';
@@ -5927,6 +6110,26 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       }
     }
 
+    if (scheduleChanged) {
+      try {
+        bookingRescheduledEmail = await maybeSendBookingRescheduledEmail({
+          booking,
+          previousDate,
+          previousTime,
+          newDate: resolvedDate,
+          newTime: resolvedTime,
+          previousStaff,
+          newStaff: staff
+        });
+      } catch (e) {
+        bookingRescheduledEmail = {
+          sent: false,
+          error: true,
+          reason: e && e.message ? String(e.message) : 'Booking reschedule email send failed'
+        };
+      }
+    }
+
     booking.lastAssignment = {
       ...(booking.lastAssignment || {}),
       staff,
@@ -5973,6 +6176,7 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       notifications: {
         sms: smsResult,
         email: emailResult,
+        rescheduleEmail: bookingRescheduledEmail,
         bookingStatusEmail,
         bookingStatusSms,
         bookingStatusAdminEmail
