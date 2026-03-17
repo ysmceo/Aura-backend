@@ -2,6 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
@@ -17,6 +18,7 @@ require('dotenv').config();
 // Fix __dirname for Vercel - when loaded through api/index.js, __dirname resolves to api/
 // We need to get the project root directory
 const IS_VERCEL_RUNTIME = Boolean(process.env.VERCEL);
+const IS_RENDER_RUNTIME = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL);
 let projectRoot = __dirname;
 if (IS_VERCEL_RUNTIME) {
   // When running on Vercel via api/index.js, __dirname is <project>/api
@@ -1441,22 +1443,28 @@ function mergeProductDefaults(existingProducts) {
 }
 
 // Use a configurable writable uploads directory for Render/persistent disks.
-const configuredUploadsDir = String(process.env.UPLOADS_DIR || '').trim();
+const configuredUploadsDir = String(process.env.UPLOADS_DIR || process.env.UPLOAD_DIR || '').trim();
 const preferredUploadsDir = configuredUploadsDir
   ? path.resolve(configuredUploadsDir)
-  : IS_VERCEL_RUNTIME
-    ? path.join('/tmp', 'uploads')
+  : (IS_VERCEL_RUNTIME || IS_RENDER_RUNTIME)
+    ? path.join(os.tmpdir(), 'uploads')
     : FRONTEND_UPLOADS_DIR;
 
 function resolveWritableUploadsDir(preferredDir) {
+  const envUploadsDir = String(process.env.UPLOADS_DIR || '').trim();
+  const envUploadDir = String(process.env.UPLOAD_DIR || '').trim();
   const candidates = [
     preferredDir,
-    path.join('/tmp', 'uploads'),
+    envUploadsDir,
+    envUploadDir,
+    IS_RENDER_RUNTIME ? '/var/data/uploads' : '',
+    path.join(os.tmpdir(), 'uploads'),
+    path.join(process.cwd(), 'uploads'),
     FRONTEND_UPLOADS_DIR
-  ].filter((value, index, arr) => {
-    const normalized = String(value || '').trim();
-    return normalized && arr.indexOf(value) === index;
-  });
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .filter((value, index, arr) => arr.indexOf(value) === index);
 
   let lastError = null;
 
@@ -1472,7 +1480,15 @@ function resolveWritableUploadsDir(preferredDir) {
     }
   }
 
-  throw lastError || new Error('No writable uploads directory available');
+  const emergencyDir = path.join(os.tmpdir(), 'uploads');
+  try {
+    fs.mkdirSync(emergencyDir, { recursive: true });
+  } catch (error) {
+    const reason = error && error.code ? String(error.code) : 'unknown_error';
+    console.error(`[Uploads] Emergency directory setup failed ("${emergencyDir}", ${reason}). Uploads may fail until UPLOADS_DIR is configured to a writable path.`);
+  }
+  console.error('[Uploads] No writable uploads directory found during startup. Falling back to temporary directory:', emergencyDir, lastError && lastError.message ? `| lastError=${lastError.message}` : '');
+  return emergencyDir;
 }
 
 const uploadsDir = resolveWritableUploadsDir(preferredUploadsDir);
