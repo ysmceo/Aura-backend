@@ -1,0 +1,146 @@
+{
+  "bookings": [],
+  "productOrders": [],
+  "messages": [],
+  "admins": [],
+  "adminAccessCodes": [],
+  "settings": {
+    "productDeliveryFees": {
+      "standard": 0,
+      "express": 1500
+    }
+  },
+  "products": [
+    {
+      "id": 1,
+      "name": "Beard Oil",
+      "category": "Grooming",
+      "price": 4500,
+      "stock": 35,
+      "image": "/images/bread oil.jpeg"
+    },
+    {
+      "id": 2,
+      "name": "Hair Oil",
+      "category": "Hair Care",
+      "price": 3500,
+      "stock": 42,
+      "image": "/images/hair oil.jpeg"
+    },
+    {
+      "id": 3,
+      "name": "Face Cream",
+      "category": "Skin Care",
+      "price": 5000,
+      "stock": 28,
+      "image": "/images/face cream.jpeg"
+    },
+    {
+      "id": 4,
+      "name": "Hair Cream",
+      "category": "Hair Care",
+      "price": 4000,
+      "stock": 40,
+      "image": "/images/hair cream.jpeg"
+    },
+    {
+      "id": 5,
+      "name": "Perfume",
+      "category": "Fragrance",
+      "price": 9000,
+      "stock": 22,
+      "image": "/images/prefume.jpeg"
+    },
+    {
+      "id": 6,
+      "name": "Premium Wig",
+      "category": "Wigs",
+      "price": 45000,
+      "stock": 12,
+      "image": "/images/premium wig.jpeg"
+    },
+    {
+      "id": 7,
+      "name": "Wig Revamping",
+      "category": "Wig Service",
+      "price": 15000,
+      "stock": 999,
+      "image": "/images/wig revamping.jpeg"
+    },
+    {
+      "id": 9,
+      "name": "Wig Fresh Oil",
+      "category": "Wig Care",
+      "price": 6000,
+      "stock": 30,
+      "image": "/images/wig fresh oil.jpeg"
+    }
+  ],
+  "services": [
+    {
+      "id": 1,
+      "name": "Hair Cut",
+      "price": 5000,
+      "duration": 30,
+      "image": "/images/p1.webp"
+    },
+    {
+      "id": 2,
+      "name": "Hair Coloring",
+      "price": 15000,
+      "duration": 60,
+      "image": "/images/p2 hair color.jpg"
+    },
+    {
+      "id": 3,
+      "name": "Facial Treatment",
+      "price": 8000,
+      "duration": 45,
+      "image": "/images/p3.jpg"
+    },
+    {
+      "id": 4,
+      "name": "Manicure",
+      "price": 4000,
+      "duration": 30,
+      "image": "https://cdn.shopify.com/s/files/1/0422/7999/3512/files/11_40bb3f8c-aadf-47eb-9354-3c48e765ab3a_2048x2048.png?v=1641879023"
+    },
+    {
+      "id": 5,
+      "name": "Pedicure",
+      "price": 5000,
+      "duration": 40,
+      "image": "/images/p5 relaxation services.jpg"
+    },
+    {
+      "id": 6,
+      "name": "Spa",
+      "price": 12000,
+      "duration": 60,
+      "image": "/images/p5 relaxation services.jpg"
+    },
+    {
+      "id": 7,
+      "name": "Beard Trim",
+      "price": 3000,
+      "duration": 20,
+      "image": "/images/p6 styling.jpg"
+    },
+    {
+      "id": 8,
+      "name": "Full Body Massage",
+      "price": 18000,
+      "duration": 60,
+      "image": "/images/p5 relaxation services.jpg"
+    },
+    {
+      "id": 9,
+      "name": "Wig Revamping",
+      "price": 15000,
+      "duration": 1440,
+      "image": "/images/wig revamping.jpeg"
+    }
+  ],
+  "bookingNotifications": [],
+  "productOrderNotifications": []
+}
