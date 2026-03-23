@@ -106,14 +106,19 @@ function getStripeRequestOptions() {
   return acct ? { stripeAccount: acct } : undefined;
 }
 
-// Email (SMTP) configuration for admin replies
+const EMAIL_CONFIG_PLACEHOLDER_PATTERN = /(replace_with|your_|example\.com|smtp_password|app_password|brevo_api_key|sendinblue_api_key)/i;
+
+// Email delivery configuration
+const EMAIL_PROVIDER = normalizeEmailDeliveryProvider(process.env.EMAIL_PROVIDER || 'auto');
+const EMAIL_FROM = process.env.EMAIL_FROM || process.env.SMTP_FROM || 'Aura Salon <no-reply@aurasalon.com>';
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_BASE_URL = String(process.env.BREVO_BASE_URL || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true';
 const SMTP_SERVICE = String(process.env.SMTP_SERVICE || '').trim();
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM = process.env.SMTP_FROM || 'Aura Salon <no-reply@aurasalon.com>';
 const EMAIL_RETRY_MAX_ATTEMPTS = Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS) > 0
   ? Math.min(6, Math.max(1, Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS)))
   : 3;
@@ -195,18 +200,94 @@ function normalizePhoneToE164(phone) {
   return `+${onlyDigits}`;
 }
 
+function normalizeEmailDeliveryProvider(provider) {
+  const normalized = String(provider || '').trim().toLowerCase();
+  if (normalized === 'brevo' || normalized === 'smtp') {
+    return normalized;
+  }
+
+  return 'auto';
+}
+
+function parseEmailIdentity(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return { email: '', name: '' };
+  }
+
+  const match = raw.match(/^(.*)<([^<>]+)>$/);
+  if (match) {
+    return {
+      name: String(match[1] || '').trim().replace(/^"(.*)"$/, '$1'),
+      email: normalizeEmail(match[2])
+    };
+  }
+
+  return { email: normalizeEmail(raw), name: '' };
+}
+
+function splitEmailRecipients(value) {
+  return Array.from(new Set(
+    String(value || '')
+      .split(/[;,]/)
+      .map(item => normalizeEmail(item))
+      .filter(Boolean)
+  ));
+}
+
+function buildBrevoAddress(value) {
+  const identity = parseEmailIdentity(value);
+  if (!identity.email) {
+    return undefined;
+  }
+
+  return identity.name ? identity : { email: identity.email };
+}
+
+function buildBrevoRecipientList(value) {
+  return splitEmailRecipients(value).map(email => ({ email }));
+}
+
 function isSmtpConfigured() {
   const smtpUser = String(SMTP_USER || '').trim();
   const smtpPass = String(SMTP_PASS || '').trim();
-  const placeholderPattern = /(replace_with|your_|example\.com|smtp_password|app_password)/i;
-  const hasRealUser = Boolean(smtpUser) && !placeholderPattern.test(smtpUser);
-  const hasRealPass = Boolean(smtpPass) && !placeholderPattern.test(smtpPass);
+  const hasRealUser = Boolean(smtpUser) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(smtpUser);
+  const hasRealPass = Boolean(smtpPass) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(smtpPass);
   const hasService = Boolean(String(SMTP_SERVICE || '').trim());
   const hasHost = Boolean(String(SMTP_HOST || '').trim());
   return Boolean(hasService || hasHost) &&
     Boolean(Number.isFinite(SMTP_PORT) && SMTP_PORT > 0) &&
     hasRealUser &&
     hasRealPass;
+}
+
+function isBrevoConfigured() {
+  const apiKey = String(BREVO_API_KEY || '').trim();
+  return Boolean(apiKey) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(apiKey);
+}
+
+function getPreferredEmailProvider() {
+  if (EMAIL_PROVIDER === 'brevo') {
+    return isBrevoConfigured() ? 'brevo' : '';
+  }
+
+  if (EMAIL_PROVIDER === 'smtp') {
+    return isSmtpConfigured() ? 'smtp' : '';
+  }
+
+  if (isBrevoConfigured()) {
+    return 'brevo';
+  }
+
+  if (isSmtpConfigured()) {
+    return 'smtp';
+  }
+
+  return '';
+}
+
+function isEmailConfigured() {
+  return Boolean(getPreferredEmailProvider());
 }
 
 function isGmailHostConfigured() {
@@ -242,6 +323,10 @@ function isTransientEmailError(error) {
   const responseCode = Number(error && error.responseCode ? error.responseCode : 0);
 
   if (Number.isFinite(responseCode) && responseCode >= 400 && responseCode < 500) {
+    return responseCode === 408 || responseCode === 409 || responseCode === 421 || responseCode === 425 || responseCode === 429 || responseCode >= 450;
+  }
+
+  if (Number.isFinite(responseCode) && responseCode >= 500) {
     return true;
   }
 
@@ -251,9 +336,12 @@ function isTransientEmailError(error) {
     message.includes('defer') ||
     message.includes('rate limit') ||
     message.includes('throttle') ||
+    message.includes('fetch failed') ||
     code === 'ETIMEDOUT' ||
     code === 'ECONNECTION' ||
+    code === 'ECONNRESET' ||
     code === 'ESOCKET' ||
+    code === 'ENOTFOUND' ||
     code === 'EAI_AGAIN'
   );
 }
@@ -368,9 +456,173 @@ function getMailer(overrides = {}) {
   return transporter;
 }
 
+function buildBrevoAttachmentContent(value) {
+  if (Buffer.isBuffer(value)) {
+    return value.toString('base64');
+  }
+
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value).toString('base64');
+  }
+
+  if (typeof value === 'string') {
+    return Buffer.from(value).toString('base64');
+  }
+
+  if (value === null || typeof value === 'undefined') {
+    return '';
+  }
+
+  return Buffer.from(String(value)).toString('base64');
+}
+
+function buildBrevoAttachments(attachments) {
+  if (!Array.isArray(attachments) || !attachments.length) {
+    return undefined;
+  }
+
+  const mapped = attachments
+    .map((item, index) => {
+      const content = buildBrevoAttachmentContent(item && item.content);
+      if (!content) {
+        return null;
+      }
+
+      return {
+        name: String(item && item.filename ? item.filename : `attachment-${index + 1}`).trim(),
+        content
+      };
+    })
+    .filter(Boolean);
+
+  return mapped.length ? mapped : undefined;
+}
+
+async function sendEmailViaBrevoApi(mailPayload) {
+  if (!isBrevoConfigured()) {
+    const err = new Error('Brevo is not configured');
+    err.code = 'BREVO_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const sender = buildBrevoAddress(EMAIL_FROM);
+  if (!sender || !sender.email) {
+    const err = new Error('EMAIL_FROM is invalid');
+    err.code = 'EMAIL_FROM_INVALID';
+    throw err;
+  }
+
+  const to = buildBrevoRecipientList(mailPayload.to);
+  if (!to.length) {
+    const err = new Error('Email recipient is required');
+    err.code = 'EMAIL_RECIPIENT_REQUIRED';
+    throw err;
+  }
+
+  const bcc = buildBrevoRecipientList(mailPayload.bcc);
+  const replyTo = buildBrevoAddress(mailPayload.replyTo);
+
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), 20_000);
+
+  try {
+    const response = await fetch(`${BREVO_BASE_URL}/smtp/email`, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'api-key': String(BREVO_API_KEY).trim(),
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender,
+        to,
+        bcc: bcc.length ? bcc : undefined,
+        replyTo,
+        subject: String(mailPayload.subject || '').trim(),
+        textContent: String(mailPayload.text || '').trim() || undefined,
+        htmlContent: String(mailPayload.html || '').trim() || undefined,
+        attachment: buildBrevoAttachments(mailPayload.attachments)
+      }),
+      signal: controller.signal
+    });
+
+    const rawBody = await response.text();
+    let parsedBody = null;
+
+    if (rawBody) {
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch (error) {
+        parsedBody = null;
+      }
+    }
+
+    if (!response.ok) {
+      const err = new Error(
+        parsedBody && parsedBody.message
+          ? String(parsedBody.message)
+          : (rawBody || `Brevo request failed with status ${response.status}`)
+      );
+      err.code = 'BREVO_SEND_FAILED';
+      err.responseCode = response.status;
+      throw err;
+    }
+
+    return {
+      messageId: parsedBody && parsedBody.messageId ? parsedBody.messageId : `brevo-${Date.now()}`,
+      accepted: to.map(item => item.email),
+      rejected: [],
+      provider: 'brevo'
+    };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      const err = new Error('Brevo request timed out');
+      err.code = 'ETIMEDOUT';
+      throw err;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+async function sendEmailViaSmtp(mailPayload) {
+  const transporter = getMailer();
+  try {
+    return await transporter.sendMail(mailPayload);
+  } catch (primaryError) {
+    // Legacy Gmail SMTP recovery path when STARTTLS/handshake fails in some networks.
+    if (isGmailHostConfigured() && shouldRetrySmtpWithFallback(primaryError)) {
+      try {
+        const gmailFallbackTransporter = getMailer({
+          service: 'gmail',
+          host: 'smtp.gmail.com',
+          port: 465,
+          secure: true,
+          requireTLS: false,
+          tls: {
+            servername: 'smtp.gmail.com',
+            minVersion: 'TLSv1.2'
+          }
+        });
+        return await gmailFallbackTransporter.sendMail(mailPayload);
+      } catch (fallbackError) {
+        // Preserve original context while surfacing fallback failure details.
+        const err = new Error(`${String(primaryError && primaryError.message ? primaryError.message : 'SMTP send failed')} | Gmail fallback failed: ${String(fallbackError && fallbackError.message ? fallbackError.message : 'unknown')}`);
+        err.code = fallbackError && fallbackError.code ? fallbackError.code : (primaryError && primaryError.code ? primaryError.code : 'SMTP_SEND_FAILED');
+        err.responseCode = fallbackError && fallbackError.responseCode ? fallbackError.responseCode : (primaryError && primaryError.responseCode ? primaryError.responseCode : undefined);
+        throw err;
+      }
+    }
+
+    throw primaryError;
+  }
+}
+
 async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments }) {
   const mailPayload = {
-    from: SMTP_FROM,
+    from: EMAIL_FROM,
     to,
     bcc: String(bcc || '').trim() || undefined,
     subject,
@@ -396,46 +648,27 @@ async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments })
       };
     }
 
+    const provider = getPreferredEmailProvider();
+    if (!provider) {
+      const err = new Error('Email is not configured');
+      err.code = 'EMAIL_NOT_CONFIGURED';
+      throw err;
+    }
+
     let lastError = null;
 
     for (let attempt = 1; attempt <= EMAIL_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
-        const transporter = getMailer();
-        const info = await transporter.sendMail(mailPayload);
+        const info = provider === 'brevo'
+          ? await sendEmailViaBrevoApi(mailPayload)
+          : await sendEmailViaSmtp(mailPayload);
         emailDedupCache.set(dedupKey, Date.now());
         return info;
-      } catch (primaryError) {
-        // Common Gmail SMTP recovery path when STARTTLS/handshake fails in some networks.
-        if (isGmailHostConfigured() && shouldRetrySmtpWithFallback(primaryError)) {
-          try {
-            const gmailFallbackTransporter = getMailer({
-              service: 'gmail',
-              host: 'smtp.gmail.com',
-              port: 465,
-              secure: true,
-              requireTLS: false,
-              tls: {
-                servername: 'smtp.gmail.com',
-                minVersion: 'TLSv1.2'
-              }
-            });
-            const info = await gmailFallbackTransporter.sendMail(mailPayload);
-            emailDedupCache.set(dedupKey, Date.now());
-            return info;
-          } catch (fallbackError) {
-            // Preserve original context while surfacing fallback failure details.
-            const err = new Error(`${String(primaryError && primaryError.message ? primaryError.message : 'SMTP send failed')} | Gmail fallback failed: ${String(fallbackError && fallbackError.message ? fallbackError.message : 'unknown')}`);
-            err.code = fallbackError && fallbackError.code ? fallbackError.code : (primaryError && primaryError.code ? primaryError.code : 'SMTP_SEND_FAILED');
-            err.responseCode = fallbackError && fallbackError.responseCode ? fallbackError.responseCode : (primaryError && primaryError.responseCode ? primaryError.responseCode : undefined);
-            lastError = err;
-          }
-        } else {
-          lastError = primaryError;
-        }
-
-        const shouldRetry = attempt < EMAIL_RETRY_MAX_ATTEMPTS && isTransientEmailError(lastError || primaryError);
+      } catch (error) {
+        lastError = error;
+        const shouldRetry = attempt < EMAIL_RETRY_MAX_ATTEMPTS && isTransientEmailError(error);
         if (!shouldRetry) {
-          throw (lastError || primaryError);
+          throw error;
         }
 
         const delayMs = Math.round((EMAIL_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)) + (Math.random() * 300));
@@ -452,9 +685,9 @@ async function maybeSendPaymentReceiptEmail({ booking, provider, paidAmount, ref
     return { sent: false, skipped: true, reason: 'SEND_PAYMENT_EMAIL_RECEIPTS=false' };
   }
 
-  // Don't send if SMTP is not configured.
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  // Don't send if email delivery is not configured.
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -536,8 +769,8 @@ async function maybeSendBookingStatusEmail({ booking, previousStatus, newStatus 
     return { sent: false, skipped: true, reason: 'SEND_BOOKING_STATUS_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -655,8 +888,8 @@ async function maybeSendBookingCreatedEmail({ booking }) {
     return { sent: false, skipped: true, reason: 'SEND_BOOKING_CREATED_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -721,8 +954,8 @@ async function maybeSendBookingRescheduledEmail({ booking, previousDate, previou
     return { sent: false, skipped: true, reason: 'SEND_BOOKING_RESCHEDULE_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -792,8 +1025,8 @@ async function maybeSendAdminNewBookingEmail({ booking, db }) {
     return { sent: false, skipped: true, reason: 'SEND_ADMIN_NEW_BOOKING_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !db || !Array.isArray(db.admins)) {
@@ -863,8 +1096,8 @@ async function maybeSendAdminNewBookingEmail({ booking, db }) {
 }
 
 async function maybeSendAdminBookingStatusEmail({ booking, previousStatus, newStatus, db }) {
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !db || !Array.isArray(db.admins)) {
@@ -971,8 +1204,8 @@ async function maybeSendBookingTrackingCodeEmail({ booking }) {
     return { sent: false, skipped: true, reason: 'SEND_BOOKING_TRACKING_CODE_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -1030,8 +1263,8 @@ async function maybeSendProductOrderStatusEmail({ order, previousStatus, newStat
     return { sent: false, skipped: true, reason: 'SEND_PRODUCT_ORDER_STATUS_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!order || !order.email) {
@@ -1149,8 +1382,8 @@ async function maybeSendBookingInvoiceEmail({ booking }) {
     return { sent: false, skipped: true, reason: 'SEND_BOOKING_INVOICE_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!booking || !booking.email) {
@@ -1263,8 +1496,8 @@ async function maybeSendProductOrderInvoiceEmail({ order }) {
     return { sent: false, skipped: true, reason: 'SEND_PRODUCT_ORDER_INVOICE_EMAILS=false' };
   }
 
-  if (!isSmtpConfigured()) {
-    return { sent: false, skipped: true, reason: 'SMTP not configured' };
+  if (!isEmailConfigured()) {
+    return { sent: false, skipped: true, reason: 'Email not configured' };
   }
 
   if (!order || !order.email) {
@@ -3488,7 +3721,7 @@ app.post('/api/product-orders', async (req, res) => {
   let adminEmailResult = null;
   let orderInvoiceEmail = null;
   try {
-    if (SEND_ADMIN_NEW_BOOKING_EMAILS && isSmtpConfigured() && Array.isArray(db.admins) && db.admins.length) {
+    if (SEND_ADMIN_NEW_BOOKING_EMAILS && isEmailConfigured() && Array.isArray(db.admins) && db.admins.length) {
       const recipients = Array.from(new Set(db.admins.map(a => normalizeEmail(a.email)).filter(Boolean)));
       if (recipients.length) {
         const itemsHtml = order.items.map(i => `<li>${String(i.name).replace(/</g,'&lt;').replace(/>/g,'&gt;')} × ${i.quantity} — ₦${Number(i.lineTotal || 0).toLocaleString()}</li>`).join('');
@@ -5981,8 +6214,8 @@ app.post('/api/admin/bookings/:id/assignment-notify', requireAdminAuth, requireA
       const toEmail = normalizeEmail(booking.email);
       if (!toEmail) {
         emailResult = { sent: false, skipped: true, reason: 'Customer email is missing' };
-      } else if (!isSmtpConfigured()) {
-        emailResult = { sent: false, skipped: true, reason: 'SMTP is not configured' };
+      } else if (!isEmailConfigured()) {
+        emailResult = { sent: false, skipped: true, reason: 'Email is not configured' };
       } else {
         try {
           const emailInfo = await sendEmail({
@@ -6321,20 +6554,21 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['s
       </div>
     `;
 
+    const emailChannel = getPreferredEmailProvider() || 'smtp';
     let info = null;
     let delivery = {
       sent: false,
-      channel: 'smtp',
+      channel: emailChannel,
       skipped: false,
       reason: ''
     };
 
-    if (!isSmtpConfigured()) {
+    if (!isEmailConfigured()) {
       delivery = {
         sent: false,
         channel: 'manual',
         skipped: true,
-        reason: 'SMTP not configured. Reply saved in admin history.'
+        reason: 'Email not configured. Reply saved in admin history.'
       };
     } else {
       try {
@@ -6347,14 +6581,14 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['s
 
         delivery = {
           sent: true,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           reason: ''
         };
       } catch (sendError) {
         delivery = {
           sent: false,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           error: true,
           reason: sendError && sendError.message ? String(sendError.message) : 'Email send failed'
@@ -6415,7 +6649,7 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['s
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' ? 503 : 500;
+    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
     res.status(status).json({
       error: error && error.message ? error.message : 'Failed to send reply',
       code
@@ -6469,20 +6703,21 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['s
       </div>
     `;
 
+    const emailChannel = getPreferredEmailProvider() || 'smtp';
     let info = null;
     let delivery = {
       sent: false,
-      channel: 'smtp',
+      channel: emailChannel,
       skipped: false,
       reason: ''
     };
 
-    if (!isSmtpConfigured()) {
+    if (!isEmailConfigured()) {
       delivery = {
         sent: false,
         channel: 'manual',
         skipped: true,
-        reason: 'SMTP not configured. Reply saved in admin history.'
+        reason: 'Email not configured. Reply saved in admin history.'
       };
     } else {
       try {
@@ -6496,14 +6731,14 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['s
 
         delivery = {
           sent: true,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           reason: ''
         };
       } catch (sendError) {
         delivery = {
           sent: false,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           error: true,
           reason: sendError && sendError.message ? String(sendError.message) : 'Email send failed'
@@ -6565,7 +6800,7 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['s
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'BOOKING_REPLY_FAILED';
-    const status = 500;
+    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
     res.status(status).json({
       error: error && error.message ? error.message : 'Failed to send booking reply',
       code
@@ -6621,20 +6856,21 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRo
       </div>
     `;
 
+    const emailChannel = getPreferredEmailProvider() || 'smtp';
     let info = null;
     let delivery = {
       sent: false,
-      channel: 'smtp',
+      channel: emailChannel,
       skipped: false,
       reason: ''
     };
 
-    if (!isSmtpConfigured()) {
+    if (!isEmailConfigured()) {
       delivery = {
         sent: false,
         channel: 'manual',
         skipped: true,
-        reason: 'SMTP not configured. Reply saved in admin history.'
+        reason: 'Email not configured. Reply saved in admin history.'
       };
     } else {
       try {
@@ -6648,14 +6884,14 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRo
 
         delivery = {
           sent: true,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           reason: ''
         };
       } catch (sendError) {
         delivery = {
           sent: false,
-          channel: 'smtp',
+          channel: emailChannel,
           skipped: false,
           error: true,
           reason: sendError && sendError.message ? String(sendError.message) : 'Email send failed'
@@ -6719,7 +6955,7 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRo
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'ORDER_REPLY_FAILED';
-    const status = 500;
+    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
     return res.status(status).json({
       error: error && error.message ? String(error.message) : 'Failed to send order reply',
       code
@@ -6847,9 +7083,9 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     if (!SEND_ADMIN_LOGIN_OTP_EMAILS) return;
     delivery.email.attempted = true;
 
-    if (!isSmtpConfigured()) {
+    if (!isEmailConfigured()) {
       delivery.email.skipped = true;
-      delivery.email.reason = 'SMTP not configured';
+      delivery.email.reason = 'Email not configured';
       return;
     }
 
@@ -6961,7 +7197,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 
       const hintParts = [];
       if (SEND_ADMIN_LOGIN_OTP_EMAILS) {
-        hintParts.push('Configure SMTP_USER and SMTP_PASS (App Password for Gmail) to enable admin OTP email delivery.');
+        hintParts.push('Configure Brevo (EMAIL_PROVIDER=brevo + BREVO_API_KEY) or SMTP (SMTP_HOST, SMTP_USER, SMTP_PASS) to enable admin OTP email delivery.');
       }
       if (SEND_ADMIN_LOGIN_OTP_SMS) {
         hintParts.push('Configure Termii + admin phone to enable OTP SMS delivery.');
