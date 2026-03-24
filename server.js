@@ -7,7 +7,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
-const nodemailer = require('nodemailer');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const { MongoClient } = require('mongodb');
@@ -106,19 +105,12 @@ function getStripeRequestOptions() {
   return acct ? { stripeAccount: acct } : undefined;
 }
 
-const EMAIL_CONFIG_PLACEHOLDER_PATTERN = /(replace_with|your_|example\.com|smtp_password|app_password|brevo_api_key|sendinblue_api_key)/i;
+const EMAIL_CONFIG_PLACEHOLDER_PATTERN = /(replace_with|your_|example\.com|brevo_api_key|sendinblue_api_key)/i;
 
 // Email delivery configuration
-const EMAIL_PROVIDER = normalizeEmailDeliveryProvider(process.env.EMAIL_PROVIDER || 'auto');
-const EMAIL_FROM = process.env.EMAIL_FROM || process.env.SMTP_FROM || 'Aura Salon <no-reply@aurasalon.com>';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Aura Salon <no-reply@aurasalon.com>';
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_BASE_URL = String(process.env.BREVO_BASE_URL || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
-const SMTP_SECURE = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true';
-const SMTP_SERVICE = String(process.env.SMTP_SERVICE || '').trim();
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
 const EMAIL_RETRY_MAX_ATTEMPTS = Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS) > 0
   ? Math.min(6, Math.max(1, Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS)))
   : 3;
@@ -200,15 +192,6 @@ function normalizePhoneToE164(phone) {
   return `+${onlyDigits}`;
 }
 
-function normalizeEmailDeliveryProvider(provider) {
-  const normalized = String(provider || '').trim().toLowerCase();
-  if (normalized === 'brevo' || normalized === 'smtp') {
-    return normalized;
-  }
-
-  return 'auto';
-}
-
 function parseEmailIdentity(value) {
   const raw = String(value || '').trim();
   if (!raw) {
@@ -248,74 +231,18 @@ function buildBrevoRecipientList(value) {
   return splitEmailRecipients(value).map(email => ({ email }));
 }
 
-function isSmtpConfigured() {
-  const smtpUser = String(SMTP_USER || '').trim();
-  const smtpPass = String(SMTP_PASS || '').trim();
-  const hasRealUser = Boolean(smtpUser) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(smtpUser);
-  const hasRealPass = Boolean(smtpPass) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(smtpPass);
-  const hasService = Boolean(String(SMTP_SERVICE || '').trim());
-  const hasHost = Boolean(String(SMTP_HOST || '').trim());
-  return Boolean(hasService || hasHost) &&
-    Boolean(Number.isFinite(SMTP_PORT) && SMTP_PORT > 0) &&
-    hasRealUser &&
-    hasRealPass;
-}
-
 function isBrevoConfigured() {
   const apiKey = String(BREVO_API_KEY || '').trim();
   return Boolean(apiKey) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(apiKey);
 }
 
-function getPreferredEmailProvider() {
-  if (EMAIL_PROVIDER === 'brevo') {
-    return isBrevoConfigured() ? 'brevo' : '';
-  }
-
-  if (EMAIL_PROVIDER === 'smtp') {
-    return isSmtpConfigured() ? 'smtp' : '';
-  }
-
-  if (isBrevoConfigured()) {
-    return 'brevo';
-  }
-
-  if (isSmtpConfigured()) {
-    return 'smtp';
-  }
-
-  return '';
-}
-
 function isEmailConfigured() {
-  return Boolean(getPreferredEmailProvider());
+  return isBrevoConfigured();
 }
 
-function isGmailHostConfigured() {
-  const service = String(SMTP_SERVICE || '').trim().toLowerCase();
-  if (service === 'gmail') {
-    return true;
-  }
-
-  const host = String(SMTP_HOST || '').trim().toLowerCase();
-  return host === 'smtp.gmail.com' || host.endsWith('.gmail.com');
-}
-
-const mailerCache = new Map();
 const emailDedupCache = new Map();
 const emailQueuePending = [];
 let emailQueueActiveCount = 0;
-
-function shouldRetrySmtpWithFallback(error) {
-  const message = String(error && error.message ? error.message : '').toLowerCase();
-  const code = String(error && error.code ? error.code : '').toUpperCase();
-  return (
-    message.includes('greeting never received') ||
-    message.includes('timeout') ||
-    code === 'ETIMEDOUT' ||
-    code === 'ECONNECTION' ||
-    code === 'ESOCKET'
-  );
-}
 
 function isTransientEmailError(error) {
   const message = String(error && error.message ? error.message : '').toLowerCase();
@@ -400,60 +327,6 @@ function enqueueEmailTask(task) {
     emailQueuePending.push({ task, resolve, reject });
     processEmailQueue();
   });
-}
-
-function getMailer(overrides = {}) {
-  if (!isSmtpConfigured()) {
-    const err = new Error('SMTP is not configured');
-    err.code = 'SMTP_NOT_CONFIGURED';
-    throw err;
-  }
-
-  const resolvedHost = String(SMTP_HOST || '').trim();
-  const resolvedService = String(SMTP_SERVICE || '').trim();
-
-  const baseOptions = {
-    host: resolvedHost || undefined,
-    service: resolvedService || undefined,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    requireTLS: !SMTP_SECURE,
-    connectionTimeout: 20_000,
-    greetingTimeout: 20_000,
-    socketTimeout: 30_000,
-    tls: {
-      servername: resolvedHost || undefined,
-      minVersion: 'TLSv1.2'
-    },
-    auth: {
-      user: String(SMTP_USER).trim(),
-      pass: String(SMTP_PASS)
-    }
-  };
-
-  const transportOptions = { ...baseOptions, ...overrides };
-  const cacheKey = JSON.stringify({
-    host: transportOptions.host || '',
-    port: Number(transportOptions.port || 0),
-    secure: Boolean(transportOptions.secure),
-    service: String(transportOptions.service || ''),
-    user: String(transportOptions.auth && transportOptions.auth.user ? transportOptions.auth.user : ''),
-    fallback: Boolean(overrides && overrides.service === 'gmail')
-  });
-
-  if (mailerCache.has(cacheKey)) {
-    return mailerCache.get(cacheKey);
-  }
-
-  const transporter = nodemailer.createTransport({
-    ...transportOptions,
-    pool: true,
-    maxConnections: 3,
-    maxMessages: 100
-  });
-
-  mailerCache.set(cacheKey, transporter);
-  return transporter;
 }
 
 function buildBrevoAttachmentContent(value) {
@@ -587,39 +460,6 @@ async function sendEmailViaBrevoApi(mailPayload) {
   }
 }
 
-async function sendEmailViaSmtp(mailPayload) {
-  const transporter = getMailer();
-  try {
-    return await transporter.sendMail(mailPayload);
-  } catch (primaryError) {
-    // Legacy Gmail SMTP recovery path when STARTTLS/handshake fails in some networks.
-    if (isGmailHostConfigured() && shouldRetrySmtpWithFallback(primaryError)) {
-      try {
-        const gmailFallbackTransporter = getMailer({
-          service: 'gmail',
-          host: 'smtp.gmail.com',
-          port: 465,
-          secure: true,
-          requireTLS: false,
-          tls: {
-            servername: 'smtp.gmail.com',
-            minVersion: 'TLSv1.2'
-          }
-        });
-        return await gmailFallbackTransporter.sendMail(mailPayload);
-      } catch (fallbackError) {
-        // Preserve original context while surfacing fallback failure details.
-        const err = new Error(`${String(primaryError && primaryError.message ? primaryError.message : 'SMTP send failed')} | Gmail fallback failed: ${String(fallbackError && fallbackError.message ? fallbackError.message : 'unknown')}`);
-        err.code = fallbackError && fallbackError.code ? fallbackError.code : (primaryError && primaryError.code ? primaryError.code : 'SMTP_SEND_FAILED');
-        err.responseCode = fallbackError && fallbackError.responseCode ? fallbackError.responseCode : (primaryError && primaryError.responseCode ? primaryError.responseCode : undefined);
-        throw err;
-      }
-    }
-
-    throw primaryError;
-  }
-}
-
 async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments }) {
   const mailPayload = {
     from: EMAIL_FROM,
@@ -648,8 +488,7 @@ async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments })
       };
     }
 
-    const provider = getPreferredEmailProvider();
-    if (!provider) {
+    if (!isEmailConfigured()) {
       const err = new Error('Email is not configured');
       err.code = 'EMAIL_NOT_CONFIGURED';
       throw err;
@@ -659,9 +498,7 @@ async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments })
 
     for (let attempt = 1; attempt <= EMAIL_RETRY_MAX_ATTEMPTS; attempt += 1) {
       try {
-        const info = provider === 'brevo'
-          ? await sendEmailViaBrevoApi(mailPayload)
-          : await sendEmailViaSmtp(mailPayload);
+        const info = await sendEmailViaBrevoApi(mailPayload);
         emailDedupCache.set(dedupKey, Date.now());
         return info;
       } catch (error) {
@@ -676,7 +513,7 @@ async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments })
       }
     }
 
-    throw (lastError || new Error('SMTP send failed'));
+    throw (lastError || new Error('Brevo send failed'));
   });
 }
 
@@ -6554,7 +6391,7 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['s
       </div>
     `;
 
-    const emailChannel = getPreferredEmailProvider() || 'smtp';
+    const emailChannel = 'brevo';
     let info = null;
     let delivery = {
       sent: false,
@@ -6649,7 +6486,7 @@ app.post('/api/admin/messages/:id/reply', requireAdminAuth, requireAdminRole(['s
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
+    const status = code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' || code === 'EMAIL_FROM_INVALID' ? 503 : 500;
     res.status(status).json({
       error: error && error.message ? error.message : 'Failed to send reply',
       code
@@ -6703,7 +6540,7 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['s
       </div>
     `;
 
-    const emailChannel = getPreferredEmailProvider() || 'smtp';
+    const emailChannel = 'brevo';
     let info = null;
     let delivery = {
       sent: false,
@@ -6800,7 +6637,7 @@ app.post('/api/admin/bookings/:id/reply', requireAdminAuth, requireAdminRole(['s
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'BOOKING_REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
+    const status = code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' || code === 'EMAIL_FROM_INVALID' ? 503 : 500;
     res.status(status).json({
       error: error && error.message ? error.message : 'Failed to send booking reply',
       code
@@ -6856,7 +6693,7 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRo
       </div>
     `;
 
-    const emailChannel = getPreferredEmailProvider() || 'smtp';
+    const emailChannel = 'brevo';
     let info = null;
     let delivery = {
       sent: false,
@@ -6955,7 +6792,7 @@ app.post('/api/admin/product-orders/:id/reply', requireAdminAuth, requireAdminRo
     });
   } catch (error) {
     const code = error && error.code ? error.code : 'ORDER_REPLY_FAILED';
-    const status = code === 'SMTP_NOT_CONFIGURED' || code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' ? 503 : 500;
+    const status = code === 'EMAIL_NOT_CONFIGURED' || code === 'BREVO_NOT_CONFIGURED' || code === 'EMAIL_FROM_INVALID' ? 503 : 500;
     return res.status(status).json({
       error: error && error.message ? String(error.message) : 'Failed to send order reply',
       code
@@ -7057,7 +6894,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 
   const secureOtpDeliveryEnabled = SEND_ADMIN_LOGIN_OTP_EMAILS || SEND_ADMIN_LOGIN_OTP_SMS;
   const delivery = {
-    email: { attempted: false, sent: false, skipped: false, reason: '' },
+    email: { attempted: false, sent: false, skipped: false, reason: '', messageId: '' },
     sms: { attempted: false, sent: false, skipped: false, reason: '' }
   };
   const otpEmailRecipient = ADMIN_LOGIN_OTP_EMAIL_OVERRIDE || normalizeEmail(admin.email);
@@ -7124,7 +6961,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
         </div>
       `;
 
-      await withTimeout(
+      const emailInfo = await withTimeout(
         () => sendEmail({
           to: otpEmailRecipient,
           subject,
@@ -7135,8 +6972,11 @@ app.post('/api/admin/request-login-access', async (req, res) => {
       );
 
       delivery.email.sent = true;
+      delivery.email.messageId = emailInfo && emailInfo.messageId ? String(emailInfo.messageId) : '';
+      console.log(`[Admin OTP] Email accepted by Brevo for ${otpEmailRecipient || 'unknown-recipient'}${delivery.email.messageId ? ` (messageId: ${delivery.email.messageId})` : ''}`);
     } catch (error) {
       delivery.email.reason = error && error.message ? String(error.message) : 'Failed to send OTP email';
+      console.warn(`[Admin OTP] Email delivery failed for ${otpEmailRecipient || 'unknown-recipient'}: ${delivery.email.reason}`);
     }
   };
 
@@ -7197,7 +7037,7 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 
       const hintParts = [];
       if (SEND_ADMIN_LOGIN_OTP_EMAILS) {
-        hintParts.push('Configure Brevo (EMAIL_PROVIDER=brevo + BREVO_API_KEY) or SMTP (SMTP_HOST, SMTP_USER, SMTP_PASS) to enable admin OTP email delivery.');
+        hintParts.push('Configure Brevo (BREVO_API_KEY + EMAIL_FROM) to enable admin OTP email delivery.');
       }
       if (SEND_ADMIN_LOGIN_OTP_SMS) {
         hintParts.push('Configure Termii + admin phone to enable OTP SMS delivery.');
@@ -7502,6 +7342,7 @@ function startServerWithPortFallback(index = 0) {
     }
 
     console.log(`AURA SALON Server running at http://localhost:${ACTIVE_PORT}`);
+    console.log(`Email delivery: ${isEmailConfigured() ? `Brevo enabled (${EMAIL_FROM})` : 'Brevo disabled (set BREVO_API_KEY + EMAIL_FROM)'}`);
     if (index > 0) {
       console.log(`ℹ️  Auto-picked fallback port ${ACTIVE_PORT}.`);
     }
