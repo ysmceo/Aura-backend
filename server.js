@@ -6997,7 +6997,13 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     email: { attempted: false, sent: false, skipped: false, reason: '', messageId: '' },
     sms: { attempted: false, sent: false, skipped: false, reason: '' }
   };
-  const otpEmailRecipient = ADMIN_LOGIN_OTP_EMAIL_OVERRIDE || normalizeEmail(admin.email);
+  const adminEmail = normalizeEmail(admin.email);
+  const otpEmailRecipient = ADMIN_LOGIN_OTP_EMAIL_OVERRIDE || adminEmail;
+  const usingOtpEmailOverride = Boolean(
+    ADMIN_LOGIN_OTP_EMAIL_OVERRIDE &&
+    adminEmail &&
+    ADMIN_LOGIN_OTP_EMAIL_OVERRIDE !== adminEmail
+  );
 
   async function withTimeout(promiseFactory, timeoutMs) {
     let timeoutHandle;
@@ -7023,6 +7029,11 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     if (!isEmailConfigured()) {
       delivery.email.skipped = true;
       delivery.email.reason = 'Email not configured';
+      return;
+    }
+    if (!otpEmailRecipient) {
+      delivery.email.skipped = true;
+      delivery.email.reason = 'Admin email is not configured';
       return;
     }
 
@@ -7073,6 +7084,9 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 
       delivery.email.sent = true;
       delivery.email.messageId = emailInfo && emailInfo.messageId ? String(emailInfo.messageId) : '';
+      if (usingOtpEmailOverride) {
+        console.log(`[Admin OTP] Email override active. Requested ${adminEmail || normalizedEmail || 'unknown-email'}, sending to ${otpEmailRecipient}`);
+      }
       console.log(`[Admin OTP] Email accepted by Brevo for ${otpEmailRecipient || 'unknown-recipient'}${delivery.email.messageId ? ` (messageId: ${delivery.email.messageId})` : ''}`);
     } catch (error) {
       delivery.email.reason = error && error.message ? String(error.message) : 'Failed to send OTP email';
@@ -7172,7 +7186,9 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     expiresInMinutes: 10,
     deliveredBy: deliveredBy.length ? deliveredBy : ['response'],
     deliveryTargets: {
-      email: otpEmailRecipient || null
+      email: otpEmailRecipient || null,
+      requestedEmail: adminEmail || normalizedEmail || null,
+      usingEmailOverride: usingOtpEmailOverride
     },
     delivery,
     // Backward-compatibility fallback when secure OTP channels are disabled,
