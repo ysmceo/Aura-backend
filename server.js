@@ -106,11 +106,33 @@ function getStripeRequestOptions() {
 }
 
 const EMAIL_CONFIG_PLACEHOLDER_PATTERN = /(replace_with|your_|example\.com|brevo_api_key|sendinblue_api_key)/i;
+const EMAIL_CONFIG_PLACEHOLDER_VALUES = new Set([
+  'value',
+  'your_value',
+  'yourvalue',
+  'your_email',
+  'your-email',
+  'your_password',
+  'your-password',
+  'changeme',
+  'replace_me',
+  'replace-me',
+  'null',
+  'undefined'
+]);
 
 // Email delivery configuration
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Aura Salon <no-reply@aurasalon.com>';
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
-const BREVO_BASE_URL = String(process.env.BREVO_BASE_URL || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
+const EMAIL_FROM = firstNonEmpty(
+  process.env.EMAIL_FROM,
+  process.env.BREVO_FROM,
+  process.env.BREVO_SENDER,
+  process.env.BREVO_SENDER_EMAIL
+) || 'Aura Salon <no-reply@aurasalon.com>';
+const BREVO_API_KEY = firstNonEmpty(process.env.BREVO_API_KEY, process.env.SENDINBLUE_API_KEY);
+const BREVO_BASE_URL = String(firstNonEmpty(process.env.BREVO_BASE_URL, process.env.BREVO_API_BASE_URL) || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
+const BREVO_TIMEOUT_MS = Number(process.env.BREVO_TIMEOUT_MS) > 0
+  ? Math.max(5000, Number(process.env.BREVO_TIMEOUT_MS))
+  : 20000;
 const EMAIL_RETRY_MAX_ATTEMPTS = Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS) > 0
   ? Math.min(6, Math.max(1, Number(process.env.EMAIL_RETRY_MAX_ATTEMPTS)))
   : 3;
@@ -192,8 +214,54 @@ function normalizePhoneToE164(phone) {
   return `+${onlyDigits}`;
 }
 
+function sanitizeEnvText(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return '';
+  if (EMAIL_CONFIG_PLACEHOLDER_VALUES.has(normalized.toLowerCase())) return '';
+  return normalized;
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const normalized = sanitizeEnvText(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return '';
+}
+
+function uniqueNonEmpty(values) {
+  const items = Array.isArray(values) ? values : [];
+  const output = [];
+  const seen = new Set();
+
+  items.forEach((value) => {
+    const normalized = sanitizeEnvText(value);
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    output.push(normalized);
+  });
+
+  return output;
+}
+
+function isBrevoSmtpKey(value) {
+  return String(value || '').trim().toLowerCase().startsWith('xsmtpsib-');
+}
+
+function parseBrevoErrorMessage(status, parsedBody, rawBody, fallback) {
+  const detail = parsedBody && typeof parsedBody === 'object'
+    ? (parsedBody.message || parsedBody.error || parsedBody.details)
+    : '';
+  const resolved = String(detail || rawBody || fallback || '').trim();
+  return status ? `${resolved || fallback} (status ${status})` : (resolved || fallback);
+}
+
 function parseEmailIdentity(value) {
-  const raw = String(value || '').trim();
+  const raw = sanitizeEnvText(value);
   if (!raw) {
     return { email: '', name: '' };
   }
@@ -232,7 +300,7 @@ function buildBrevoRecipientList(value) {
 }
 
 function isBrevoConfigured() {
-  const apiKey = String(BREVO_API_KEY || '').trim();
+  const apiKey = sanitizeEnvText(BREVO_API_KEY);
   return Boolean(apiKey) && !EMAIL_CONFIG_PLACEHOLDER_PATTERN.test(apiKey);
 }
 
@@ -378,8 +446,17 @@ async function sendEmailViaBrevoApi(mailPayload) {
     throw err;
   }
 
-  const sender = buildBrevoAddress(EMAIL_FROM);
-  if (!sender || !sender.email) {
+  if (isBrevoSmtpKey(BREVO_API_KEY)) {
+    const err = new Error('BREVO_API_KEY looks like an SMTP key (xsmtpsib-...). Use a Brevo API key (xkeysib-...).');
+    err.code = 'BREVO_API_KEY_INVALID';
+    throw err;
+  }
+
+  const senderCandidates = uniqueNonEmpty([
+    mailPayload && mailPayload.from ? mailPayload.from : '',
+    EMAIL_FROM
+  ]);
+  if (!senderCandidates.length) {
     const err = new Error('EMAIL_FROM is invalid');
     err.code = 'EMAIL_FROM_INVALID';
     throw err;
@@ -395,69 +472,92 @@ async function sendEmailViaBrevoApi(mailPayload) {
   const bcc = buildBrevoRecipientList(mailPayload.bcc);
   const replyTo = buildBrevoAddress(mailPayload.replyTo);
 
-  const controller = new AbortController();
-  const timeoutHandle = setTimeout(() => controller.abort(), 20_000);
+  let lastError = null;
 
-  try {
-    const response = await fetch(`${BREVO_BASE_URL}/smtp/email`, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'api-key': String(BREVO_API_KEY).trim(),
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        sender,
-        to,
-        bcc: bcc.length ? bcc : undefined,
-        replyTo,
-        subject: String(mailPayload.subject || '').trim(),
-        textContent: String(mailPayload.text || '').trim() || undefined,
-        htmlContent: String(mailPayload.html || '').trim() || undefined,
-        attachment: buildBrevoAttachments(mailPayload.attachments)
-      }),
-      signal: controller.signal
-    });
+  for (const candidate of senderCandidates) {
+    const sender = buildBrevoAddress(candidate);
+    if (!sender || !sender.email) {
+      continue;
+    }
 
-    const rawBody = await response.text();
-    let parsedBody = null;
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), BREVO_TIMEOUT_MS);
 
-    if (rawBody) {
-      try {
-        parsedBody = JSON.parse(rawBody);
-      } catch (error) {
-        parsedBody = null;
+    try {
+      const response = await fetch(`${BREVO_BASE_URL}/smtp/email`, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'api-key': String(BREVO_API_KEY).trim(),
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          sender,
+          to,
+          bcc: bcc.length ? bcc : undefined,
+          replyTo,
+          subject: String(mailPayload.subject || '').trim(),
+          textContent: String(mailPayload.text || '').trim() || undefined,
+          htmlContent: String(mailPayload.html || '').trim() || undefined,
+          attachment: buildBrevoAttachments(mailPayload.attachments)
+        }),
+        signal: controller.signal
+      });
+
+      const rawBody = await response.text();
+      let parsedBody = null;
+
+      if (rawBody) {
+        try {
+          parsedBody = JSON.parse(rawBody);
+        } catch (error) {
+          parsedBody = null;
+        }
       }
-    }
 
-    if (!response.ok) {
-      const err = new Error(
-        parsedBody && parsedBody.message
-          ? String(parsedBody.message)
-          : (rawBody || `Brevo request failed with status ${response.status}`)
-      );
-      err.code = 'BREVO_SEND_FAILED';
-      err.responseCode = response.status;
-      throw err;
-    }
+      if (!response.ok) {
+        const err = new Error(parseBrevoErrorMessage(response.status, parsedBody, rawBody, 'Brevo API request failed'));
+        err.code = 'BREVO_SEND_FAILED';
+        err.responseCode = response.status;
+        const looksLikeSenderIssue = /from|sender|domain|forbidden|unauthorized|invalid/i.test(String(err.message || ''));
+        err.canRetryWithAnotherSender = looksLikeSenderIssue;
+        lastError = err;
+        if (!looksLikeSenderIssue) {
+          throw err;
+        }
 
-    return {
-      messageId: parsedBody && parsedBody.messageId ? parsedBody.messageId : `brevo-${Date.now()}`,
-      accepted: to.map(item => item.email),
-      rejected: [],
-      provider: 'brevo'
-    };
-  } catch (error) {
-    if (error && error.name === 'AbortError') {
-      const err = new Error('Brevo request timed out');
-      err.code = 'ETIMEDOUT';
-      throw err;
-    }
+        continue;
+      }
 
-    throw error;
-  } finally {
-    clearTimeout(timeoutHandle);
+      return {
+        messageId: parsedBody && parsedBody.messageId ? parsedBody.messageId : `brevo-${Date.now()}`,
+        accepted: to.map(item => item.email),
+        rejected: [],
+        provider: 'brevo'
+      };
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        const err = new Error('Brevo request timed out');
+        err.code = 'ETIMEDOUT';
+        lastError = err;
+        throw err;
+      }
+
+      lastError = error;
+      if (error && error.code === 'BREVO_SEND_FAILED' && error.canRetryWithAnotherSender) {
+        continue;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
+
+  throw (lastError || (() => {
+    const err = new Error('EMAIL_FROM is invalid');
+    err.code = 'EMAIL_FROM_INVALID';
+    return err;
+  })());
 }
 
 async function sendEmail({ to, subject, text, html, replyTo, bcc, attachments }) {
@@ -7342,7 +7442,16 @@ function startServerWithPortFallback(index = 0) {
     }
 
     console.log(`AURA SALON Server running at http://localhost:${ACTIVE_PORT}`);
-    console.log(`Email delivery: ${isEmailConfigured() ? `Brevo enabled (${EMAIL_FROM})` : 'Brevo disabled (set BREVO_API_KEY + EMAIL_FROM)'}`);
+    console.log('Email delivery status:', {
+      configured: isEmailConfigured(),
+      brevoConfigured: Boolean(BREVO_API_KEY),
+      brevoApiKeyLooksLikeSmtp: isBrevoSmtpKey(BREVO_API_KEY),
+      from: EMAIL_FROM,
+      baseUrl: BREVO_BASE_URL
+    });
+    if (isBrevoSmtpKey(BREVO_API_KEY)) {
+      console.warn('BREVO_API_KEY looks like an SMTP key (xsmtpsib-...). Use a Brevo API key (xkeysib-...) for HTTP delivery.');
+    }
     if (index > 0) {
       console.log(`ℹ️  Auto-picked fallback port ${ACTIVE_PORT}.`);
     }
