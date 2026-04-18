@@ -2512,6 +2512,167 @@ function readDatabase() {
   return fallbackDb;
 }
 
+async function readDatabaseFresh() {
+  if (isMongoPrimaryEnabled()) {
+    const fromMongo = await buildDatabaseObjectFromMongo();
+    if (fromMongo) {
+      mongoPrimaryCache = fromMongo;
+      mongoPrimaryCacheLoadedAt = Date.now();
+      writeDatabaseFile(fromMongo);
+      triggerPrismaMirrorSync(fromMongo);
+      return fromMongo;
+    }
+
+    const fallbackDb = readDatabaseFromJsonDisk();
+    mongoPrimaryCache = fallbackDb;
+    mongoPrimaryCacheLoadedAt = Date.now();
+    return fallbackDb;
+  }
+
+  if (isPrismaPrimaryEnabled()) {
+    const fromPrisma = await buildDatabaseObjectFromPrisma();
+    if (fromPrisma) {
+      prismaPrimaryCache = fromPrisma;
+      prismaPrimaryCacheLoadedAt = Date.now();
+      writeDatabaseFile(fromPrisma);
+      triggerMongoMirrorSync(fromPrisma);
+      return fromPrisma;
+    }
+
+    const fallbackDb = readDatabaseFromJsonDisk();
+    prismaPrimaryCache = fallbackDb;
+    prismaPrimaryCacheLoadedAt = Date.now();
+    return fallbackDb;
+  }
+
+  return readDatabaseFromJsonDisk();
+}
+
+async function writeDatabaseDurably(data) {
+  const normalized = normalizeDatabaseObject(data);
+
+  if (isMongoPrimaryEnabled()) {
+    await syncJsonDatabaseToMongo(normalized);
+    mongoPrimaryCache = normalized;
+    mongoPrimaryCacheLoadedAt = Date.now();
+    writeDatabaseFile(normalized);
+    triggerPrismaMirrorSync(normalized);
+    return normalized;
+  }
+
+  if (isPrismaPrimaryEnabled()) {
+    await syncJsonDatabaseToPrisma(normalized);
+    prismaPrimaryCache = normalized;
+    prismaPrimaryCacheLoadedAt = Date.now();
+    writeDatabaseFile(normalized);
+    triggerMongoMirrorSync(normalized);
+    return normalized;
+  }
+
+  writeDatabase(normalized);
+  return normalized;
+}
+
+function normalizeCoordinate(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < min || number > max) {
+    return null;
+  }
+  return number;
+}
+
+function buildGoogleMapsLink(latitude, longitude) {
+  const lat = normalizeCoordinate(latitude, -90, 90);
+  const lon = normalizeCoordinate(longitude, -180, 180);
+  if (lat === null || lon === null) {
+    return '';
+  }
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lat},${lon}`)}`;
+}
+
+function normalizeSubmittedLocation(latitude, longitude, mapLink) {
+  const lat = normalizeCoordinate(latitude, -90, 90);
+  const lon = normalizeCoordinate(longitude, -180, 180);
+  const fallbackMapLink = String(mapLink || '').trim();
+
+  if (lat === null || lon === null) {
+    return {
+      latitude: '',
+      longitude: '',
+      mapLink: fallbackMapLink
+    };
+  }
+
+  return {
+    latitude: lat,
+    longitude: lon,
+    mapLink: buildGoogleMapsLink(lat, lon) || fallbackMapLink
+  };
+}
+
+function formatResolvedAddress(displayName, mapLink) {
+  const address = String(displayName || '').trim();
+  const link = String(mapLink || '').trim();
+
+  if (address && link) {
+    return `${address} (Google Maps: ${link})`;
+  }
+
+  return address || (link ? `Current location (Google Maps: ${link})` : '');
+}
+
+async function reverseGeocodeCoordinates(latitude, longitude) {
+  const lat = normalizeCoordinate(latitude, -90, 90);
+  const lon = normalizeCoordinate(longitude, -180, 180);
+
+  if (lat === null || lon === null) {
+    const error = new Error('Valid latitude and longitude are required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const query = new URLSearchParams({
+    format: 'jsonv2',
+    lat: String(lat),
+    lon: String(lon),
+    zoom: '18',
+    addressdetails: '1'
+  });
+
+  try {
+    const response = await fetch(`https://nominatim.openstreetmap.org/reverse?${query.toString()}`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': `AuraSalon/1.0 (${String(PUBLIC_BASE_URL || 'local').trim()})`
+      },
+      signal: controller.signal
+    });
+
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(`Address lookup failed (${response.status})`);
+      error.statusCode = 502;
+      error.payload = payload;
+      throw error;
+    }
+
+    const mapLink = buildGoogleMapsLink(lat, lon);
+    const address = String(payload && payload.display_name ? payload.display_name : '').trim();
+
+    return {
+      latitude: lat,
+      longitude: lon,
+      address,
+      mapLink,
+      formattedAddress: formatResolvedAddress(address, mapLink)
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function addBookingNotification(db, booking, type, message) {
   if (!db.bookingNotifications) {
     db.bookingNotifications = [];
@@ -3403,8 +3564,16 @@ function validateAdminToken(token, db) {
   }
 }
 
-function requireAdminAuth(req, res, next) {
-  const db = readDatabase();
+async function requireAdminAuth(req, res, next) {
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to load admin account data from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   if (db.admins.length === 0) {
     return res.status(401).json({ error: 'No admin account configured yet' });
@@ -3544,7 +3713,10 @@ app.post('/api/product-orders', async (req, res) => {
     address,
     paymentMethod,
     items,
-    deliverySpeed
+    deliverySpeed,
+    deliveryLatitude,
+    deliveryLongitude,
+    deliveryMapLink
   } = req.body || {};
 
   const normalizedName = String(name || '').trim();
@@ -3554,6 +3726,7 @@ app.post('/api/product-orders', async (req, res) => {
   const normalizedPaymentMethod = String(paymentMethod || '').trim();
   const normalizedItems = Array.isArray(items) ? items : [];
   const normalizedDeliverySpeed = normalizeDeliverySpeed(deliverySpeed);
+  const normalizedDeliveryLocation = normalizeSubmittedLocation(deliveryLatitude, deliveryLongitude, deliveryMapLink);
 
   if (!normalizedName || !normalizedEmail || !normalizedPhone || !normalizedAddress || !normalizedPaymentMethod) {
     return res.status(400).json({ error: 'name, email, phone, address and paymentMethod are required' });
@@ -3622,6 +3795,9 @@ app.post('/api/product-orders', async (req, res) => {
     email: normalizedEmail,
     phone: normalizedPhone,
     address: normalizedAddress,
+    deliveryLatitude: normalizedDeliveryLocation.latitude,
+    deliveryLongitude: normalizedDeliveryLocation.longitude,
+    deliveryMapLink: normalizedDeliveryLocation.mapLink,
     paymentMethod: normalizedPaymentMethod,
     items: orderItems,
     itemsSubtotal,
@@ -3825,6 +4001,10 @@ app.get('/api/product-orders/track', async (req, res) => {
       paymentProvider: order.paymentProvider,
       paymentReference: order.paymentReference,
       bankTransferReference: order.bankTransferReference,
+      address: order.address || '',
+      deliveryLatitude: order.deliveryLatitude || '',
+      deliveryLongitude: order.deliveryLongitude || '',
+      deliveryMapLink: order.deliveryMapLink || '',
       deliverySpeed: order.deliverySpeed,
       shippedAt: order.shippedAt || null,
       onTheWayAt: order.onTheWayAt || null,
@@ -4111,6 +4291,21 @@ app.get('/api/weather', async (req, res) => {
   }
 });
 
+// Reverse geocode browser-provided coordinates for booking/order addresses.
+app.get('/api/location/reverse-geocode', async (req, res) => {
+  try {
+    const latitude = req.query.latitude || req.query.lat;
+    const longitude = req.query.longitude || req.query.lon || req.query.lng;
+    const result = await reverseGeocodeCoordinates(latitude, longitude);
+    return res.json(result);
+  } catch (error) {
+    const statusCode = Number(error && error.statusCode) || 500;
+    return res.status(statusCode).json({
+      error: error && error.message ? String(error.message) : 'Failed to resolve current location'
+    });
+  }
+});
+
 // Grok chatbot (Customer)
 app.post('/api/grok/chat', async (req, res) => {
   const message = String(req.body && req.body.message ? req.body.message : '').trim();
@@ -4208,6 +4403,9 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
     paymentPlan,
     homeServiceRequested,
     homeServiceAddress,
+    homeServiceLatitude,
+    homeServiceLongitude,
+    homeServiceMapLink,
     refreshment,
     specialRequests,
     productSelections
@@ -4219,6 +4417,7 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
   const normalizedHomeServiceRequested = String(homeServiceRequested || '').trim().toLowerCase();
   const isHomeServiceRequested = normalizedHomeServiceRequested === 'true' || normalizedHomeServiceRequested === '1' || normalizedHomeServiceRequested === 'yes';
   const normalizedHomeServiceAddress = String(homeServiceAddress || '').trim();
+  const normalizedHomeServiceLocation = normalizeSubmittedLocation(homeServiceLatitude, homeServiceLongitude, homeServiceMapLink);
   const hasServiceSelection =
     (serviceId !== undefined && serviceId !== null && String(serviceId).trim() !== '') ||
     (serviceIds !== undefined && serviceIds !== null && String(serviceIds).trim() !== '');
@@ -4406,6 +4605,9 @@ app.post('/api/bookings', upload.single('styleImage'), async (req, res) => {
     bankTransferReference: '',
     serviceMode: isHomeServiceRequested ? 'home' : 'in_salon',
     homeServiceAddress: isHomeServiceRequested ? normalizedHomeServiceAddress : '',
+    homeServiceLatitude: isHomeServiceRequested ? normalizedHomeServiceLocation.latitude : '',
+    homeServiceLongitude: isHomeServiceRequested ? normalizedHomeServiceLocation.longitude : '',
+    homeServiceMapLink: isHomeServiceRequested ? normalizedHomeServiceLocation.mapLink : '',
     refreshment: refreshment || 'No',
     specialRequests: specialRequests || '',
     requestedProducts,
@@ -5318,6 +5520,9 @@ app.get('/api/bookings/track', (req, res) => {
       paymentReceiptStatus: booking.paymentReceiptStatus || '',
       serviceMode: booking.serviceMode,
       homeServiceAddress: booking.homeServiceAddress,
+      homeServiceLatitude: booking.homeServiceLatitude || '',
+      homeServiceLongitude: booking.homeServiceLongitude || '',
+      homeServiceMapLink: booking.homeServiceMapLink || '',
       refreshment: booking.refreshment || 'No',
       specialRequests: booking.specialRequests || ''
     },
@@ -5386,6 +5591,9 @@ app.get('/api/bookings/:id/track', (req, res) => {
       paymentReceiptStatus: booking.paymentReceiptStatus || '',
       serviceMode: booking.serviceMode,
       homeServiceAddress: booking.homeServiceAddress,
+      homeServiceLatitude: booking.homeServiceLatitude || '',
+      homeServiceLongitude: booking.homeServiceLongitude || '',
+      homeServiceMapLink: booking.homeServiceMapLink || '',
       refreshment: booking.refreshment || 'No',
       specialRequests: booking.specialRequests || ''
     },
@@ -6957,7 +7165,15 @@ app.post('/api/admin/request-login-access', async (req, res) => {
     return res.status(400).json({ error: 'Please enter a valid email address' });
   }
 
-  const db = readDatabase();
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to load admin account data from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   if (db.admins.length === 0) {
     return res.status(400).json({ error: 'No admin account configured yet' });
@@ -7175,7 +7391,14 @@ app.post('/api/admin/request-login-access', async (req, res) => {
   };
 
   db.adminAccessCodes.push(accessCodeRecord);
-  writeDatabase(db);
+  try {
+    await writeDatabaseDurably(db);
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to save admin one-time access code to the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   return res.json({
     message: fallbackToResponse
@@ -7198,8 +7421,17 @@ app.post('/api/admin/request-login-access', async (req, res) => {
 });
 
 // Admin registration status
-app.get('/api/admin/registration-status', (req, res) => {
-  const db = readDatabase();
+app.get('/api/admin/registration-status', async (req, res) => {
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to verify admin registration status from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
+
   const registrationOpen = db.admins.length === 0;
 
   res.json({
@@ -7211,7 +7443,7 @@ app.get('/api/admin/registration-status', (req, res) => {
 });
 
 // Reset admin password using one-time code (forgot password flow)
-app.post('/api/admin/reset-password', (req, res) => {
+app.post('/api/admin/reset-password', async (req, res) => {
   const { email, oneTimeCode, newPassword, secretPasscode } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const normalizedOneTimeCode = normalizeOneTimeCode(oneTimeCode);
@@ -7236,7 +7468,15 @@ app.post('/api/admin/reset-password', (req, res) => {
     return res.status(401).json({ error: 'Invalid secret passcode' });
   }
 
-  const db = readDatabase();
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to load admin account data from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
   const admin = db.admins.find(a => normalizeEmail(a.email) === normalizedEmail);
 
   if (!admin) {
@@ -7270,7 +7510,14 @@ app.post('/api/admin/reset-password', (req, res) => {
     return !isExpired && !code.used;
   });
 
-  writeDatabase(db);
+  try {
+    await writeDatabaseDurably(db);
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to save admin password reset to the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   return res.json({
     message: 'Password reset successful. You can now login with your new password.'
@@ -7278,7 +7525,7 @@ app.post('/api/admin/reset-password', (req, res) => {
 });
 
 // Admin Registration
-app.post('/api/admin/register', (req, res) => {
+app.post('/api/admin/register', async (req, res) => {
   const { email, password, name, secretPasscode, phone } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const normalizedPassword = String(password || '').trim();
@@ -7294,7 +7541,15 @@ app.post('/api/admin/register', (req, res) => {
     return res.status(400).json({ error: 'Please enter a valid email address' });
   }
 
-  const db = readDatabase();
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to load admin registration data from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   // Only one admin can ever self-register
   if (db.admins.length > 0) {
@@ -7323,7 +7578,14 @@ app.post('/api/admin/register', (req, res) => {
   };
 
   db.admins.push(newAdmin);
-  writeDatabase(db);
+  try {
+    await writeDatabaseDurably(db);
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to save admin account to the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   res.status(201).json({ 
     message: 'Admin registered successfully',
@@ -7332,7 +7594,7 @@ app.post('/api/admin/register', (req, res) => {
 });
 
 // Admin Login
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { email, password, oneTimeCode, secretPasscode } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const normalizedPassword = String(password || '').trim();
@@ -7347,7 +7609,15 @@ app.post('/api/admin/login', (req, res) => {
     return res.status(400).json({ error: 'Please enter a valid email address' });
   }
 
-  const db = readDatabase();
+  let db;
+  try {
+    db = await readDatabaseFresh();
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to load admin account data from the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
   const admin = db.admins.find(a => {
     const adminEmail = normalizeEmail(a.email);
     const adminPassword = String(a.password || '').trim();
@@ -7397,7 +7667,14 @@ app.post('/api/admin/login', (req, res) => {
     const isExpired = new Date(code.expiresAt).getTime() <= now;
     return !isExpired && !code.used;
   });
-  writeDatabase(db);
+  try {
+    await writeDatabaseDurably(db);
+  } catch (error) {
+    return res.status(503).json({
+      error: 'Unable to save admin login state to the backend datastore',
+      details: error && error.message ? String(error.message) : undefined
+    });
+  }
 
   res.json({ 
     message: 'Login successful',
@@ -7407,7 +7684,7 @@ app.post('/api/admin/login', (req, res) => {
 });
 
 // Verify Admin
-app.post('/api/admin/verify', (req, res) => {
+app.post('/api/admin/verify', async (req, res) => {
   const { token } = req.body;
 
   if (!token) {
@@ -7415,7 +7692,7 @@ app.post('/api/admin/verify', (req, res) => {
   }
 
   try {
-    const db = readDatabase();
+    const db = await readDatabaseFresh();
     const admin = validateAdminToken(token, db);
 
     if (db.admins.length === 0) {
