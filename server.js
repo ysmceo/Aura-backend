@@ -7435,13 +7435,16 @@ app.get('/api/admin/registration-status', async (req, res) => {
     });
   }
 
-  const registrationOpen = db.admins.length === 0;
+  const adminCount = Array.isArray(db.admins) ? db.admins.length : 0;
+  const registrationOpen = true;
 
   res.json({
     registrationOpen,
-    message: registrationOpen
+    adminCount,
+    registrationMode: adminCount === 0 ? 'initial_setup' : 'additional_admin',
+    message: adminCount === 0
       ? 'Admin registration is open for initial setup'
-      : 'Admin registration is closed. Contact the existing admin for access.'
+      : 'Admin registration is open for additional admins'
   });
 });
 
@@ -7551,13 +7554,6 @@ app.post('/api/admin/register', async (req, res) => {
     return res.status(503).json({
       error: 'Unable to load admin registration data from the backend datastore',
       details: error && error.message ? String(error.message) : undefined
-    });
-  }
-
-  // Only one admin can ever self-register
-  if (db.admins.length > 0) {
-    return res.status(403).json({
-      error: 'Admin registration is closed. Contact the existing admin for consent.'
     });
   }
 
