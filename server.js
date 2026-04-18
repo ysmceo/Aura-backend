@@ -1901,6 +1901,10 @@ const MONGODB_STATE_COLLECTION = String(process.env.MONGODB_STATE_COLLECTION || 
 const MONGODB_STATE_DOCUMENT_ID = 'primary';
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const DATA_STORE_MODE = String(process.env.DATA_STORE_MODE || 'auto').trim().toLowerCase();
+const DATASTORE_FALLBACK_TO_JSON = String(process.env.DATASTORE_FALLBACK_TO_JSON || 'true').trim().toLowerCase() !== 'false';
+const REMOTE_DATASTORE_TIMEOUT_MS = Number(process.env.REMOTE_DATASTORE_TIMEOUT_MS) > 0
+  ? Math.max(1000, Number(process.env.REMOTE_DATASTORE_TIMEOUT_MS))
+  : 10000;
 
 let mongoClientPromise = null;
 let mongoSyncInFlight = false;
@@ -1949,7 +1953,10 @@ async function getMongoCollection() {
 
   if (!mongoClientPromise) {
     const client = new MongoClient(MONGODB_URI, {
-      ignoreUndefined: true
+      ignoreUndefined: true,
+      serverSelectionTimeoutMS: REMOTE_DATASTORE_TIMEOUT_MS,
+      connectTimeoutMS: REMOTE_DATASTORE_TIMEOUT_MS,
+      socketTimeoutMS: REMOTE_DATASTORE_TIMEOUT_MS
     });
 
     mongoClientPromise = client.connect().catch((error) => {
@@ -2516,15 +2523,27 @@ function readDatabase() {
   return fallbackDb;
 }
 
+function warnJsonDatastoreFallback(source, error) {
+  const message = error && error.message ? String(error.message).split('\n')[0] : String(error || 'unknown datastore error');
+  console.warn(`[${source}] Remote datastore failed; using local JSON fallback: ${message}`);
+}
+
 async function readDatabaseFresh() {
   if (isMongoPrimaryEnabled()) {
-    const fromMongo = await buildDatabaseObjectFromMongo();
-    if (fromMongo) {
-      mongoPrimaryCache = fromMongo;
-      mongoPrimaryCacheLoadedAt = Date.now();
-      writeDatabaseFile(fromMongo);
-      triggerPrismaMirrorSync(fromMongo);
-      return fromMongo;
+    try {
+      const fromMongo = await buildDatabaseObjectFromMongo();
+      if (fromMongo) {
+        mongoPrimaryCache = fromMongo;
+        mongoPrimaryCacheLoadedAt = Date.now();
+        writeDatabaseFile(fromMongo);
+        triggerPrismaMirrorSync(fromMongo);
+        return fromMongo;
+      }
+    } catch (error) {
+      if (!DATASTORE_FALLBACK_TO_JSON) {
+        throw error;
+      }
+      warnJsonDatastoreFallback('Mongo Primary Read', error);
     }
 
     const fallbackDb = readDatabaseFromJsonDisk();
@@ -2534,13 +2553,20 @@ async function readDatabaseFresh() {
   }
 
   if (isPrismaPrimaryEnabled()) {
-    const fromPrisma = await buildDatabaseObjectFromPrisma();
-    if (fromPrisma) {
-      prismaPrimaryCache = fromPrisma;
-      prismaPrimaryCacheLoadedAt = Date.now();
-      writeDatabaseFile(fromPrisma);
-      triggerMongoMirrorSync(fromPrisma);
-      return fromPrisma;
+    try {
+      const fromPrisma = await buildDatabaseObjectFromPrisma();
+      if (fromPrisma) {
+        prismaPrimaryCache = fromPrisma;
+        prismaPrimaryCacheLoadedAt = Date.now();
+        writeDatabaseFile(fromPrisma);
+        triggerMongoMirrorSync(fromPrisma);
+        return fromPrisma;
+      }
+    } catch (error) {
+      if (!DATASTORE_FALLBACK_TO_JSON) {
+        throw error;
+      }
+      warnJsonDatastoreFallback('Prisma Primary Read', error);
     }
 
     const fallbackDb = readDatabaseFromJsonDisk();
@@ -2556,7 +2582,19 @@ async function writeDatabaseDurably(data) {
   const normalized = normalizeDatabaseObject(data);
 
   if (isMongoPrimaryEnabled()) {
-    await syncJsonDatabaseToMongo(normalized);
+    try {
+      await syncJsonDatabaseToMongo(normalized);
+    } catch (error) {
+      if (!DATASTORE_FALLBACK_TO_JSON) {
+        throw error;
+      }
+      warnJsonDatastoreFallback('Mongo Primary Write', error);
+      mongoPrimaryCache = normalized;
+      mongoPrimaryCacheLoadedAt = Date.now();
+      writeDatabaseFile(normalized);
+      triggerPrismaMirrorSync(normalized);
+      return normalized;
+    }
     mongoPrimaryCache = normalized;
     mongoPrimaryCacheLoadedAt = Date.now();
     writeDatabaseFile(normalized);
@@ -2565,7 +2603,19 @@ async function writeDatabaseDurably(data) {
   }
 
   if (isPrismaPrimaryEnabled()) {
-    await syncJsonDatabaseToPrisma(normalized);
+    try {
+      await syncJsonDatabaseToPrisma(normalized);
+    } catch (error) {
+      if (!DATASTORE_FALLBACK_TO_JSON) {
+        throw error;
+      }
+      warnJsonDatastoreFallback('Prisma Primary Write', error);
+      prismaPrimaryCache = normalized;
+      prismaPrimaryCacheLoadedAt = Date.now();
+      writeDatabaseFile(normalized);
+      triggerMongoMirrorSync(normalized);
+      return normalized;
+    }
     prismaPrimaryCache = normalized;
     prismaPrimaryCacheLoadedAt = Date.now();
     writeDatabaseFile(normalized);
