@@ -1891,7 +1891,11 @@ const packagedDbPath = path.join(__dirname, 'database.json');
 const dbPath = IS_VERCEL_RUNTIME
   ? path.join('/tmp', 'database.json')
   : packagedDbPath;
-const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
+function normalizeMongoConnectionString(value) {
+  return String(value || '').trim().replace(/([?&])retrwrites=/ig, '$1retryWrites=');
+}
+
+const MONGODB_URI = normalizeMongoConnectionString(process.env.MONGODB_URI || '');
 const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || 'aura_salon').trim();
 const MONGODB_STATE_COLLECTION = String(process.env.MONGODB_STATE_COLLECTION || 'app_state').trim();
 const MONGODB_STATE_DOCUMENT_ID = 'primary';
