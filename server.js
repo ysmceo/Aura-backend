@@ -2610,15 +2610,18 @@ function normalizeSubmittedLocation(latitude, longitude, mapLink) {
   };
 }
 
-function formatResolvedAddress(displayName, mapLink) {
-  const address = String(displayName || '').trim();
-  const link = String(mapLink || '').trim();
-
-  if (address && link) {
-    return `${address} (Google Maps: ${link})`;
+function formatCoordinateLabel(latitude, longitude) {
+  const lat = normalizeCoordinate(latitude, -90, 90);
+  const lon = normalizeCoordinate(longitude, -180, 180);
+  if (lat === null || lon === null) {
+    return 'Current location detected';
   }
+  return `Current location: ${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+}
 
-  return address || (link ? `Current location (Google Maps: ${link})` : '');
+function formatResolvedAddress(displayName, latitude, longitude) {
+  const address = String(displayName || '').trim();
+  return address || formatCoordinateLabel(latitude, longitude);
 }
 
 async function reverseGeocodeCoordinates(latitude, longitude) {
@@ -2666,7 +2669,7 @@ async function reverseGeocodeCoordinates(latitude, longitude) {
       longitude: lon,
       address,
       mapLink,
-      formattedAddress: formatResolvedAddress(address, mapLink)
+      formattedAddress: formatResolvedAddress(address, lat, lon)
     };
   } finally {
     clearTimeout(timeoutId);
